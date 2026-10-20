@@ -22,7 +22,7 @@ The provider never transcodes audio: the channel already hands it canonical
 ## Install
 
 ```sh
-dsh plugin --profile <profile> add github:unera/dsh-speech-gate
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate   # or @dr-co/dsh-speech-gate from npm once published
 ```
 
 Then mount it in the profile patch (`$DSH_HOME/profiles/<profile>/cordis.patch.yml`)
@@ -125,7 +125,7 @@ as the earlier OpenAI-only spelling. `baseUrl`, `apiKeyRef`, `apiKeyEnv` and
 
 For an agent wiring this up on a Host, in order:
 
-1. `dsh plugin --profile <profile> add github:unera/dsh-speech-gate`
+1. `dsh plugin --profile <profile> add github:unera/dsh-speech-gate   # or @dr-co/dsh-speech-gate from npm once published`
    (or `file:/path/to/checkout` while iterating).
 2. In `$DSH_HOME/profiles/<profile>/cordis.patch.yml`, mount the service row and
    insert this plugin — copy the example above. If a bundle already inserts
