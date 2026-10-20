@@ -21,12 +21,35 @@ The provider never transcodes audio: the channel already hands it canonical
 
 ## Install
 
+Pick whichever source fits the Host. All three install the same package, and
+`dsh plugin` records the result in the profile's `package.json`.
+
+**From npm** — a released version, the default choice:
+
 ```sh
-dsh plugin --profile <profile> add @dr-co/dsh-speech-gate
+dsh plugin --profile <profile> add @dr-co/dsh-speech-gate        # latest release
+dsh plugin --profile <profile> add @dr-co/dsh-speech-gate@0.1.0  # pinned, reproducible
 ```
 
-The GitHub repository (`github:unera/dsh-speech-gate`) works too and tracks the
-main branch instead of a release.
+**From GitHub** — no registry involved; useful when you want the current main:
+
+```sh
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate            # main branch
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate#v0.1.0     # a tag
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate#206fb1e    # a commit
+```
+
+**From a local checkout** — while developing, `file:` follows your edits
+(re-run `add` after changing files, because pnpm copies the directory):
+
+```sh
+git clone https://github.com/unera/dsh-speech-gate
+dsh plugin --profile <profile> add file:$PWD/dsh-speech-gate
+```
+
+The package ships no `dsh.bundle`, so `dsh plugin add` installs it as a plain
+dependency and the profile patch below is what actually mounts it — `dsh plugin`
+prints a warning saying exactly that.
 
 Then mount it in the profile patch (`$DSH_HOME/profiles/<profile>/cordis.patch.yml`)
 next to the service it feeds:
@@ -38,17 +61,23 @@ next to the service it feeds:
     language: ru
 - insert:
     - id: speech-provider
-      name: dsh-speech-gate
+      name: '@dr-co/dsh-speech-gate'
       config:
         providers:
           - id: openai-compatible
-            backend: api
+            backend: configured-model
             name: OpenAI gpt-4o-mini-transcribe
             location: cloud
             languages: [ru, en]
-            baseUrl: https://api.openai.com/v1
+            language: ru
             model: gpt-4o-mini-transcribe
-            apiKeyFile: ~/.config/dsh-stt/openai.key
+          - id: mistral-voxtral
+            backend: configured-model
+            name: Mistral Voxtral
+            location: cloud
+            languages: [ru, en]
+            language: ru
+            model: voxtral-mini-latest
           - id: whisper-local
             backend: api
             name: Local whisper server
@@ -67,10 +96,9 @@ next to the service it feeds:
 
 Every entry becomes a selectable provider; with the optional
 `@deepseek-ai/dsh-experimental-voice-input-bundle` enabled, that choice (and the
-language) appears in the Web UI under *Plugins → Voice Input*.
-
-A flat config (`backend`, `baseUrl`, `model`, …) registers a single provider and
-is still supported.
+language) appears in the Web UI under *Plugins → Voice Input*. A flat config
+(`backend`, `baseUrl`, `model`, …) registers a single provider and is still
+supported.
 
 ## Reusing the Host model connector (`configured-model`)
 
