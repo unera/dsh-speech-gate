@@ -14,6 +14,7 @@ Two backends, one package:
 | --- | --- | --- |
 | `api` | `POST {baseUrl}/audio/transcriptions` (OpenAI-compatible multipart) | hosted models, `whisper.cpp --server`, `faster-whisper-server`, `whisper-asr-webservice` |
 | `exec` | runs a command, prints the transcript on stdout | `whisper-cli` or `faster-whisper` on the same machine |
+| `configured-model` | same call as `api`, but the endpoint and key come from the model connector the Host already has | a Host whose OpenAI/Mistral model is configured once, without pasting the secret twice |
 
 The provider never transcodes audio: the channel already hands it canonical
 16 kHz mono PCM16 WAV, which is what every `speechToText` provider accepts.
