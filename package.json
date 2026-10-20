@@ -1,0 +1,35 @@
+{
+  "name": "dsh-speech-gate",
+  "version": "0.1.0",
+  "description": "Speech-to-text gate for DeepSeek Harness: OpenAI-compatible API or a local command.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unera/dsh-speech-gate.git"
+  },
+  "homepage": "https://github.com/unera/dsh-speech-gate#readme",
+  "bugs": {
+    "url": "https://github.com/unera/dsh-speech-gate/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "speech-to-text",
+    "whisper",
+    "plugin"
+  ]
+}
