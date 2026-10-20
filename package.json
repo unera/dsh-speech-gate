@@ -31,5 +31,11 @@
     "speech-to-text",
     "whisper",
     "plugin"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  }
 }
