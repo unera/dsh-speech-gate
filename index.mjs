@@ -42,6 +42,64 @@ function stringList(value, field) {
   return Object.freeze(value.map((entry) => requireString(entry, field)));
 }
 
+// Hosts whose model connector already stores the secret this recognizer needs.
+// The Host exposes only provider ids (`llm.listProviders()`), never endpoints or
+// credential names, so the mapping lives here and grows one line per provider.
+const CONFIGURED_PROVIDERS = Object.freeze({
+  openai: { baseUrl: 'https://api.openai.com/v1', apiKeyRef: 'OPENAI_API_KEY' },
+  mistral: { baseUrl: 'https://api.mistral.ai/v1', apiKeyRef: 'MISTRAL_API_KEY' },
+  groq: { baseUrl: 'https://api.groq.com/openai/v1', apiKeyRef: 'GROQ_API_KEY' },
+});
+
+// Model families that only one provider serves, so a config can skip `provider`.
+const MODEL_FAMILIES = Object.freeze([
+  [/^voxtral/i, 'mistral'],
+  [/^whisper-large-v3/i, 'groq'],
+  [/^whisper/i, 'openai'],
+  [/^gpt-4o/i, 'openai'],
+  [/^gpt-4/i, 'openai'],
+]);
+
+/** Provider ids the Host has configured right now, if the llm service is mounted. */
+function hostProviders(ctx) {
+  const llm = typeof ctx?.get === 'function' ? ctx.get('llm') : ctx?.llm;
+  if (typeof llm?.listProviders !== 'function') return [];
+  try {
+    return llm.listProviders().map((entry) => entry?.id).filter((id) => typeof id === 'string');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Pick the provider a `configured-model` entry talks to.
+ *
+ * Order: explicit `provider`, then the model family, then the only configured
+ * provider. Anything else fails loudly with the candidates, because guessing a
+ * credential here would silently transcribe through the wrong account.
+ */
+export function resolveConfiguredProvider(options, ctx) {
+  const configured = hostProviders(ctx);
+  const candidates = configured.length > 0
+    ? configured.filter((id) => CONFIGURED_PROVIDERS[id])
+    : Object.keys(CONFIGURED_PROVIDERS);
+  const named = options.provider
+    ? requireString(options.provider, 'provider')
+    : MODEL_FAMILIES.find(([pattern]) => pattern.test(options.model))?.[1];
+  if (named) {
+    const known = CONFIGURED_PROVIDERS[named];
+    if (!known) {
+      throw invalid(`unknown provider "${named}"; supported: ${Object.keys(CONFIGURED_PROVIDERS).join(', ')}`);
+    }
+    if (configured.length > 0 && !configured.includes(named)) {
+      throw invalid(`provider "${named}" has no model connector configured in this Host (available: ${configured.join(', ')})`);
+    }
+    return { provider: named, ...known };
+  }
+  if (candidates.length === 1) return { provider: candidates[0], ...CONFIGURED_PROVIDERS[candidates[0]] };
+  throw invalid(`cannot tell which provider serves model "${options.model}"; set provider to one of: ${candidates.join(', ') || 'openai, mistral, groq'}`);
+}
+
 /**
  * Validate plugin config once, so a bad entry fails at load time.
  *
@@ -62,9 +120,17 @@ export function normalizeConfig(config = {}) {
   return Object.freeze({ providers: Object.freeze([normalizeProvider(config)]) });
 }
 
-function normalizeProvider(config = {}) {
+function normalizeProvider(input = {}) {
+  // `configured-model` reuses the model connector the user configured in the
+  // Host: the entry names a transcription model, and the endpoint plus the
+  // credential come from that connector. `configured-openai-model` is the
+  // earlier, OpenAI-only spelling of the same thing.
+  const configured = input.backend === 'configured-model' || input.backend === 'configured-openai-model';
+  const config = configured ? { ...input, backend: 'api' } : input;
   const backend = config.backend ?? 'api';
-  if (backend !== 'api' && backend !== 'exec') throw invalid('backend must be "api" or "exec"');
+  if (backend !== 'api' && backend !== 'exec') {
+    throw invalid('backend must be "api", "exec" or "configured-model"');
+  }
   const languages = stringList(config.languages, 'languages');
   const base = {
     backend,
@@ -77,6 +143,26 @@ function normalizeProvider(config = {}) {
     language: typeof config.language === 'string' && config.language.trim() ? config.language.trim() : null,
     timeoutMs: Number.isSafeInteger(config.timeoutMs) && config.timeoutMs > 0 ? config.timeoutMs : 120_000,
   };
+  if (configured) {
+    const model = requireString(config.model, 'model');
+    const provider = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : null;
+    const family = provider ?? MODEL_FAMILIES.find(([pattern]) => pattern.test(model))?.[1] ?? null;
+    const known = family ? CONFIGURED_PROVIDERS[family] : null;
+    return Object.freeze({
+      ...base,
+      configured: true,
+      provider: family,
+      baseUrl: config.baseUrl
+        ? requireString(config.baseUrl, 'baseUrl').replace(/\/+$/, '')
+        : known?.baseUrl ?? null,
+      model,
+      apiKeyRef: typeof config.apiKeyRef === 'string' && config.apiKeyRef.trim()
+        ? config.apiKeyRef.trim() : known?.apiKeyRef ?? null,
+      apiKeyEnv: typeof config.apiKeyEnv === 'string' && config.apiKeyEnv.trim() ? config.apiKeyEnv.trim() : null,
+      apiKeyFile: typeof config.apiKeyFile === 'string' && config.apiKeyFile.trim() ? config.apiKeyFile.trim() : null,
+      extraFields: config.extraFields && typeof config.extraFields === 'object' ? { ...config.extraFields } : {},
+    });
+  }
   if (backend === 'api') {
     return Object.freeze({
       ...base,
@@ -215,13 +301,21 @@ export function createProvider(options, ctx) {
     },
     async transcribe(input, signal) {
       const elapsed = timed();
-      const apiKey = options.backend === 'api' ? await resolveApiKey(options, ctx) : '';
-      if (options.backend === 'api' && !apiKey && options.apiKeyRef) {
-        throw new Error(`speech API key is unavailable (${options.apiKeyRef})`);
+      // A `configured-model` entry resolves its endpoint and credential only
+      // here, so adding a model connector in the Host needs no edit to this
+      // plugin's config.
+      const target = options.configured
+        ? { ...options, ...resolveConfiguredProvider(options, ctx) }
+        : options;
+      const apiKey = target.backend === 'api' ? await resolveApiKey(target, ctx) : '';
+      if (target.backend === 'api' && !apiKey && target.apiKeyRef) {
+        throw new Error(
+          `speech API key is unavailable (${target.apiKeyRef}); configure the ${target.provider ?? 'matching'} model connector in the Host`,
+        );
       }
-      const text = options.backend === 'api'
-        ? await transcribeViaApi({ ...options, __apiKey: apiKey }, input, signal)
-        : await runCommand(options, input, signal);
+      const text = target.backend === 'api'
+        ? await transcribeViaApi({ ...target, __apiKey: apiKey }, input, signal)
+        : await runCommand(target, input, signal);
       return {
         text,
         audioSeconds: wavSeconds(input.audio) ?? 0,

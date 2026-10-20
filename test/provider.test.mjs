@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
   apply,
+  resolveConfiguredProvider,
   normalizeConfig,
   resolveApiKey,
   runCommand,
@@ -201,4 +202,49 @@ test('a providers list registers every configured recognizer', () => {
     ],
   }), /provider ids must be unique/u);
   disposers[0]();
+});
+
+test('configured-openai-model reuses the Host OpenAI secret', () => {
+  const options = one({ backend: 'configured-openai-model', model: 'gpt-4o-transcribe', language: 'ru' });
+  assert.equal(options.backend, 'api');
+  assert.equal(options.baseUrl, 'https://api.openai.com/v1');
+  assert.equal(options.apiKeyRef, 'OPENAI_API_KEY');
+  assert.equal(options.model, 'gpt-4o-transcribe');
+  assert.equal(options.apiKeyFile, null);
+  // The key still comes from the Host credentials, not from a second copy.
+  const override = one({ backend: 'configured-openai-model', model: 'gpt-4o-transcribe', apiKeyRef: 'MY_KEY' });
+  assert.equal(override.apiKeyRef, 'MY_KEY');
+  assert.throws(() => one({ backend: 'nope' }), /backend must be/u);
+});
+
+test('configured-model resolves provider, endpoint and credential', () => {
+  const llm = { listProviders: () => [{ id: 'openai', name: 'OpenAI' }, { id: 'mistral', name: 'Mistral' }] };
+  const ctx = { get: (service) => (service === 'llm' ? llm : null) };
+
+  const voxtral = one({ backend: 'configured-model', model: 'voxtral-mini-latest' });
+  assert.deepEqual(resolveConfiguredProvider(voxtral, ctx),
+    { provider: 'mistral', baseUrl: 'https://api.mistral.ai/v1', apiKeyRef: 'MISTRAL_API_KEY' });
+
+  const openai = one({ backend: 'configured-model', model: 'gpt-4o-transcribe' });
+  assert.equal(resolveConfiguredProvider(openai, ctx).apiKeyRef, 'OPENAI_API_KEY');
+
+  // An explicit provider wins over the model family.
+  const forced = one({ backend: 'configured-model', model: 'voxtral-mini-latest', provider: 'openai' });
+  assert.equal(resolveConfiguredProvider(forced, ctx).baseUrl, 'https://api.openai.com/v1');
+
+  // A single configured provider resolves an unknown model family.
+  const onlyMistral = { get: (service) => (service === 'llm' ? { listProviders: () => [{ id: 'mistral' }] } : null) };
+  const custom = one({ backend: 'configured-model', model: 'some-new-model' });
+  assert.equal(resolveConfiguredProvider(custom, onlyMistral).provider, 'mistral');
+
+  // Otherwise the failure names the candidates instead of guessing.
+  const ambiguous = one({ backend: 'configured-model', model: 'some-new-model' });
+  assert.throws(() => resolveConfiguredProvider(ambiguous, ctx), /cannot tell which provider serves model/u);
+
+  // A provider the Host has not configured is refused, not silently used.
+  const missing = one({ backend: 'configured-model', model: 'whisper-large-v3-turbo' });
+  assert.throws(() => resolveConfiguredProvider(missing, ctx), /has no model connector configured/u);
+
+  // The alias still accepts the old spelling.
+  assert.equal(one({ backend: 'configured-openai-model', model: 'gpt-4o-mini-transcribe' }).provider, 'openai');
 });
