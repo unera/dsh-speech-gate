@@ -22,8 +22,11 @@ The provider never transcodes audio: the channel already hands it canonical
 ## Install
 
 ```sh
-dsh plugin --profile <profile> add github:unera/dsh-speech-gate   # or @dr-co/dsh-speech-gate from npm once published
+dsh plugin --profile <profile> add @dr-co/dsh-speech-gate
 ```
+
+The GitHub repository (`github:unera/dsh-speech-gate`) works too and tracks the
+main branch instead of a release.
 
 Then mount it in the profile patch (`$DSH_HOME/profiles/<profile>/cordis.patch.yml`)
 next to the service it feeds:
