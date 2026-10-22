@@ -1,0 +1,24 @@
+# Bundle layer for @dr-co/dsh-speech-gate.
+#
+# Installing the package mounts this row, so the plugin shows up in the settings
+# plugin list where it can be switched off or removed like any other.
+#
+# The default below reuses a transcription model from the connector you already
+# configured in the Host (`backend: configured-model`), so nothing has to be
+# duplicated here. Other shapes, all valid for this same row:
+#
+#   config:
+#     backend: api                       # any OpenAI-compatible endpoint
+#     endpoint: http://127.0.0.1:8080/v1
+#     model: whisper-1
+#
+#   config:
+#     backend: exec                      # a local command, stdin gets the WAV path
+#     command: whisper-cli
+#     args: ['-m', '/models/ggml-large-v3.bin', '-f']
+- insert:
+    - id: dsh-speech-gate
+      name: '@dr-co/dsh-speech-gate'
+      config:
+        backend: configured-model
+        model: whisper-1
