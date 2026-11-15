@@ -4,7 +4,11 @@ import test from 'node:test';
 
 import {
   apply,
+  apiKeyRefFor,
+  assignApiKeyRefs,
   createProvider,
+  keyPresence,
+  persistApiKeyRefs,
   resolveConfiguredProvider,
   normalizeConfig,
   resolveApiKey,
@@ -21,6 +25,11 @@ import {
 /** The single provider a flat config produces. */
 function one(config) {
   return normalizeConfig(config).providers[0];
+}
+
+/** The same provider with the credential name the plugin would give it. */
+function keyed(options) {
+  return assignApiKeyRefs([options], {}).providers[0];
 }
 
 function canonicalWav(seconds = 0.5) {
@@ -157,6 +166,7 @@ test('the plugin registers one provider and disposes it with the effect', () => 
       disposers.push(disposer);
       return () => disposer?.();
     },
+    logger: { warn: () => {} },
   };
   apply(ctx, { backend: 'api', model: 'whisper-1', languages: ['ru'] });
   assert.equal(registered.length, 1);
@@ -190,6 +200,7 @@ test('a providers list registers every configured recognizer', () => {
   const ctx = {
     speechToText: { register(provider) { ids.push(provider.info.id); return () => {}; } },
     effect(callback) { const disposer = callback(); disposers.push(disposer); return () => disposer?.(); },
+    logger: { warn: () => {} },
   };
   apply(ctx, {
     providers: [
@@ -209,16 +220,20 @@ test('a providers list registers every configured recognizer', () => {
   disposers[0]();
 });
 
-test('configured-openai-model reuses the Host OpenAI secret', () => {
+test('configured-openai-model names its own key and keeps the connector as fallback', () => {
   const options = one({ backend: 'configured-openai-model', model: 'gpt-4o-transcribe', language: 'ru' });
   assert.equal(options.backend, 'api');
   assert.equal(options.baseUrl, 'https://api.openai.com/v1');
-  assert.equal(options.apiKeyRef, 'OPENAI_API_KEY');
+  // The record has a name of its own, generated later from its id; the connector's
+  // credential is what answers until a person types something into our card.
+  assert.equal(options.apiKeyRef, null);
+  assert.equal(options.connectorApiKeyRef, 'OPENAI_API_KEY');
   assert.equal(options.model, 'gpt-4o-transcribe');
   assert.equal(options.apiKeyFile, null);
-  // The key still comes from the Host credentials, not from a second copy.
+  // An explicit name is the record's own, and still wins over the connector's.
   const override = one({ backend: 'configured-openai-model', model: 'gpt-4o-transcribe', apiKeyRef: 'MY_KEY' });
   assert.equal(override.apiKeyRef, 'MY_KEY');
+  assert.equal(override.connectorApiKeyRef, 'OPENAI_API_KEY');
   assert.throws(() => one({ backend: 'nope' }), /backend must be/u);
 });
 
@@ -228,10 +243,10 @@ test('configured-model resolves provider, endpoint and credential', () => {
 
   const voxtral = one({ backend: 'configured-model', model: 'voxtral-mini-latest' });
   assert.deepEqual(resolveConfiguredProvider(voxtral, ctx),
-    { provider: 'mistral', baseUrl: 'https://api.mistral.ai/v1', apiKeyRef: 'MISTRAL_API_KEY' });
+    { provider: 'mistral', baseUrl: 'https://api.mistral.ai/v1', connectorApiKeyRef: 'MISTRAL_API_KEY' });
 
   const openai = one({ backend: 'configured-model', model: 'gpt-4o-transcribe' });
-  assert.equal(resolveConfiguredProvider(openai, ctx).apiKeyRef, 'OPENAI_API_KEY');
+  assert.equal(resolveConfiguredProvider(openai, ctx).connectorApiKeyRef, 'OPENAI_API_KEY');
 
   // An explicit provider wins over the model family.
   const forced = one({ backend: 'configured-model', model: 'voxtral-mini-latest', provider: 'openai' });
@@ -254,14 +269,18 @@ test('configured-model resolves provider, endpoint and credential', () => {
   assert.equal(one({ backend: 'configured-openai-model', model: 'gpt-4o-mini-transcribe' }).provider, 'openai');
 });
 
-test('provider yandex is selected by config and reuses the SpeechKit key', () => {
+test('provider yandex is selected by config and owns its key name', () => {
   const options = one({ backend: 'configured-model', provider: 'yandex', language: 'ru' });
   assert.equal(options.backend, 'api');
   assert.equal(options.provider, 'yandex');
   assert.equal(options.endpoint, YANDEX_STT_ENDPOINT);
   assert.equal(options.baseUrl, null);
   assert.equal(options.model, null);
-  assert.equal(options.apiKeyRef, 'YANDEX_SPEECHKIT_API_KEY');
+  // No hard-wired SpeechKit name: the record's own name is generated from its id,
+  // so a second recognizer of the same account never shares a secret by accident.
+  assert.equal(options.apiKeyRef, null);
+  assert.equal(options.connectorApiKeyRef, null);
+  assert.equal(keyed(options).apiKeyRef, 'STT_KEY_YANDEX');
   assert.equal(options.id, 'yandex');
   assert.equal(options.displayName, 'Yandex SpeechKit');
   assert.equal(options.location, 'cloud');
@@ -386,7 +405,9 @@ test('a yandex provider resolves the shared key and hits SpeechKit', async () =>
     return { ok: true, status: 200, async text() { return JSON.stringify({ result: 'готово' }); } };
   };
   try {
-    const options = one({ backend: 'configured-model', provider: 'yandex', language: 'ru' });
+    // The live profile spells the name out, because the synthesizer already uses
+    // that key: an explicit name is respected.
+    const options = one({ backend: 'configured-model', provider: 'yandex', language: 'ru', apiKeyRef: 'YANDEX_SPEECHKIT_API_KEY' });
     const ctx = {
       get: (service) => (service === 'credentials'
         ? { async resolve(ref) { return { value: ref === 'YANDEX_SPEECHKIT_API_KEY' ? 'yc-key' : '' }; } }
@@ -405,11 +426,248 @@ test('a yandex provider resolves the shared key and hits SpeechKit', async () =>
 });
 
 test('a missing Yandex key names the credential instead of calling out', async () => {
-  const provider = createProvider(one({ provider: 'yandex' }), {
+  // The key the message names is the one this record works with — the generated
+  // name, not a hard-coded one from some other plugin.
+  const provider = createProvider(keyed(one({ provider: 'yandex' })), {
     get: () => ({ async resolve() { return { value: '' }; } }),
   });
   await assert.rejects(
     () => provider.transcribe({ audio: canonicalWav(0.1) }),
-    /YANDEX_SPEECHKIT_API_KEY/u,
+    /STT_KEY_YANDEX/u,
   );
+});
+
+/* ── credential names: one per record ─────────────────────────────────────── */
+
+/** Let the fire-and-forget profile write in `apply()` settle. */
+const settle = async () => {
+  for (let index = 0; index < 6; index += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
+/** A credentials store that answers from a map and records what it was asked. */
+function storeOf(values = {}) {
+  const store = {
+    calls: [],
+    async resolve(ref) {
+      store.calls.push(ref);
+      return Object.hasOwn(values, ref) ? { value: values[ref] } : undefined;
+    },
+    async set(ref, value) {
+      store.calls.push(`set:${ref}`);
+      values[ref] = value;
+    },
+  };
+  return store;
+}
+
+test('a credential name is derived from the record id', () => {
+  assert.equal(apiKeyRefFor('yandex-stt'), 'STT_KEY_YANDEX_STT');
+  assert.equal(apiKeyRefFor('OpenAI gpt-4o'), 'STT_KEY_OPENAI_GPT_4O');
+  assert.equal(apiKeyRefFor(''), '');
+  // The store's own limit: a long id is cut, not refused.
+  assert.equal([...apiKeyRefFor('x'.repeat(90))].length, 64);
+});
+
+test('every API record gets a name of its own, and a local command gets none', () => {
+  const { providers, added } = assignApiKeyRefs(normalizeConfig({
+    providers: [
+      // Explicit: a working key already lives under this name.
+      { id: 'yandex-stt', provider: 'yandex', apiKeyRef: 'YANDEX_SPEECHKIT_API_KEY' },
+      { id: 'yandex-new', provider: 'yandex' },
+      // A connector record has its own name too, with the connector as fallback.
+      { id: 'openai-transcribe', backend: 'configured-model', model: 'gpt-4o-transcribe' },
+      { id: 'whisper-local', backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1', model: 'whisper-1' },
+      { id: 'whisper-exec', backend: 'exec', command: 'whisper-cli' },
+    ],
+  }).providers, {});
+
+  assert.deepEqual(providers.map((provider) => provider.apiKeyRef), [
+    'YANDEX_SPEECHKIT_API_KEY',
+    'STT_KEY_YANDEX_NEW',
+    'STT_KEY_OPENAI_TRANSCRIBE',
+    'STT_KEY_WHISPER_LOCAL',
+    // A command takes no key, so it has no name to generate.
+    null,
+  ]);
+  // Only the generated ones are news for the profile; the explicit one is not ours
+  // to rewrite.
+  assert.deepEqual(added, {
+    'yandex-new': 'STT_KEY_YANDEX_NEW',
+    'openai-transcribe': 'STT_KEY_OPENAI_TRANSCRIBE',
+    'whisper-local': 'STT_KEY_WHISPER_LOCAL',
+  });
+  // The connector name stays where it belongs: on the record, as a fallback.
+  assert.equal(providers[2].connectorApiKeyRef, 'OPENAI_API_KEY');
+});
+
+test('a remembered name is kept, and two ids that flatten alike do not collide', () => {
+  const { providers, added } = assignApiKeyRefs(normalizeConfig({
+    providers: [
+      { id: 'yandex-stt', provider: 'yandex' },
+      { id: 'yandex.stt', provider: 'yandex' },
+    ],
+  }).providers, { 'yandex-stt': 'STT_KEY_REMEMBERED' });
+
+  // A name written into the profile earlier is used as it stands...
+  assert.equal(providers[0].apiKeyRef, 'STT_KEY_REMEMBERED');
+  // ...and a second record that would flatten to the same name gets its own.
+  assert.equal(providers[1].apiKeyRef, 'STT_KEY_YANDEX_STT');
+  assert.deepEqual(added, { 'yandex.stt': 'STT_KEY_YANDEX_STT' });
+});
+
+test('the generated names are written into the profile once', async () => {
+  const updates = [];
+  const ctx = {
+    get: (service) => (service === 'settings'
+      ? { async update(entryId, patch) { updates.push({ entryId, patch }); } }
+      : null),
+    fiber: { entry: { options: { id: 'dsh-speech-gate' } } },
+  };
+
+  assert.equal(await persistApiKeyRefs(ctx, { 'yandex-new': 'STT_KEY_YANDEX_NEW' }), true);
+  assert.deepEqual(updates, [{
+    entryId: 'dsh-speech-gate',
+    patch: { apiKeyRefs: { 'yandex-new': 'STT_KEY_YANDEX_NEW' } },
+  }]);
+
+  // Without the settings service or a profile entry the names cannot be kept.
+  assert.equal(await persistApiKeyRefs({ get: () => null, fiber: { entry: { options: { id: 'x' } } } }, {}), false);
+  assert.equal(await persistApiKeyRefs({ get: () => ({ update: async () => {} }) }, {}), false);
+});
+
+test('applying a config persists the generated names and keeps given ones', async () => {
+  const updates = [];
+  const ctx = {
+    get: (service) => (service === 'settings'
+      ? { async update(entryId, patch) { updates.push(patch); } }
+      : null),
+    fiber: { entry: { options: { id: 'dsh-speech-gate' } } },
+    speechToText: { register() { return () => {}; } },
+    effect: (callback) => { callback(); },
+    logger: { warn: () => {}, info: () => {} },
+  };
+
+  apply(ctx, {
+    providers: [
+      { id: 'yandex-stt', provider: 'yandex', apiKeyRef: 'YANDEX_SPEECHKIT_API_KEY' },
+      { id: 'openai', backend: 'configured-model', model: 'whisper-1' },
+    ],
+  });
+  await settle();
+  assert.deepEqual(updates, [{ apiKeyRefs: { openai: 'STT_KEY_OPENAI' } }]);
+
+  // A profile that already carries the names is not written again.
+  updates.length = 0;
+  apply(ctx, {
+    apiKeyRefs: { yandex: 'STT_KEY_YANDEX' },
+    providers: [{ id: 'yandex', provider: 'yandex' }],
+  });
+  await settle();
+  assert.deepEqual(updates, []);
+});
+
+test('key presence is read through ctx.get, never through the property', async () => {
+  const store = storeOf({ STT_KEY_YANDEX: 'value' });
+  const ctx = {
+    get: (service) => (service === 'credentials' ? store : null),
+    // A Host that did not mount this plugin with `credentials` in `inject` throws
+    // on the property; reading it here would turn a presence question into an error.
+    get credentials() { throw new Error('cannot get property "credentials" without inject'); },
+  };
+  assert.equal(await keyPresence('STT_KEY_YANDEX', ctx), true);
+  assert.equal(await keyPresence('STT_KEY_OTHER', ctx), false);
+  // No store at all is "no key", not a rejection.
+  assert.equal(await keyPresence('STT_KEY_YANDEX', { get: () => null }), false);
+});
+
+test('a key resolves in order: own name, connector, env, file', async () => {
+  const store = storeOf({ OWN: 'from-own', CONNECTOR: 'from-connector' });
+  const ctx = { get: (service) => (service === 'credentials' ? store : null) };
+
+  assert.equal(await resolveApiKey({ apiKeyRef: 'OWN', connectorApiKeyRef: 'CONNECTOR' }, ctx), 'from-own');
+  assert.equal(await resolveApiKey({ apiKeyRef: 'MISSING', connectorApiKeyRef: 'CONNECTOR' }, ctx), 'from-connector');
+
+  process.env.DSH_SPEECH_ORDER_KEY = 'from-env';
+  try {
+    // The env fallback answers only when neither credential name holds a value.
+    assert.equal(await resolveApiKey({ apiKeyRef: 'MISSING', apiKeyEnv: 'DSH_SPEECH_ORDER_KEY' }, ctx), 'from-env');
+    assert.equal(
+      await resolveApiKey({ apiKeyRef: 'OWN', apiKeyEnv: 'DSH_SPEECH_ORDER_KEY' }, ctx),
+      'from-own',
+      'a value in our own card wins over the environment',
+    );
+  } finally {
+    delete process.env.DSH_SPEECH_ORDER_KEY;
+  }
+});
+
+test('a connector record transcribes on the connector key until one is typed', async () => {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, async json() { return { text: 'готово' }; } };
+  };
+  try {
+    const options = keyed(one({ backend: 'configured-model', provider: 'openai', model: 'gpt-4o-transcribe' }));
+    assert.equal(options.apiKeyRef, 'STT_KEY_OPENAI_COMPATIBLE');
+    const ctx = {
+      get: (service) => {
+        if (service === 'llm') return { listProviders: () => [{ id: 'openai' }] };
+        if (service === 'credentials') {
+          return { async resolve(ref) { return { value: ref === 'OPENAI_API_KEY' ? 'sk-connector' : '' }; } };
+        }
+        return null;
+      },
+    };
+    // Nothing typed into our card: the model settings answer, exactly as before.
+    const provider = createProvider(options, ctx);
+    assert.equal((await provider.transcribe({ audio: canonicalWav(0.1) })).text, 'готово');
+    assert.equal(calls[0].options.headers.Authorization, 'Bearer sk-connector');
+
+    // A key typed into our card wins, because the record's own name is asked first.
+    const ownCtx = {
+      get: (service) => {
+        if (service === 'llm') return { listProviders: () => [{ id: 'openai' }] };
+        if (service === 'credentials') {
+          return {
+            async resolve(ref) {
+              if (ref === 'STT_KEY_OPENAI_COMPATIBLE') return { value: 'own-key' };
+              if (ref === 'OPENAI_API_KEY') return { value: 'sk-connector' };
+              return undefined;
+            },
+          };
+        }
+        return null;
+      },
+    };
+    await createProvider(options, ownCtx).transcribe({ audio: canonicalWav(0.1) });
+    assert.equal(calls[1].options.headers.Authorization, 'Bearer own-key');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('a local endpoint with no key transcribes without an Authorization header', async () => {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, async json() { return { text: 'локально' }; } };
+  };
+  try {
+    // A generated name must not turn into a requirement: a whisper server next
+    // door usually wants no key, and this record keeps working without one.
+    const options = keyed(one({ backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1', model: 'whisper-1', location: 'host-local' }));
+    assert.equal(options.apiKeyRef, 'STT_KEY_OPENAI_COMPATIBLE');
+    assert.equal(options.keyRequired, false);
+    const ctx = { get: (service) => (service === 'credentials' ? storeOf({}) : null) };
+
+    const result = await createProvider(options, ctx).transcribe({ audio: canonicalWav(0.1) });
+    assert.equal(result.text, 'локально');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.headers.Authorization, undefined);
+  } finally {
+    globalThis.fetch = original;
+  }
 });

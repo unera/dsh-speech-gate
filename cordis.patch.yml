@@ -18,8 +18,11 @@
 #     args: ['-m', '/models/ggml-large-v3.bin', '-f']
 #
 #   config:
-#     provider: yandex                   # Yandex SpeechKit, key from credentials
+#     provider: yandex                   # Yandex SpeechKit, key from the settings card
 #     language: ru
+#     # apiKeyRef: YANDEX_SPEECHKIT_API_KEY   # only to share the synthesizer's key;
+#                                             # otherwise STT_KEY_<ID> is generated
+#                                             # and written into this profile entry
 - insert:
     - id: dsh-speech-gate
       name: '@dr-co/dsh-speech-gate'

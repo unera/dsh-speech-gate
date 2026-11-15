@@ -20,6 +20,45 @@ Three shapes, one package:
 The provider never transcodes audio: the channel already hands it canonical
 16 kHz mono PCM16 WAV, which is what every `speechToText` provider accepts.
 
+## The settings card (web)
+
+The package ships a browser half — a section of its own in the web settings,
+«Распознавание речи (speech gate)», next to the synthesis card. It exists so the
+recognizer keys are typed somewhere sane instead of being put into the credentials
+store by hand: the card reads the state from the plugin, writes only through the
+host's authenticated `/api` channel, and never draws a stored value back.
+
+What the card offers per record:
+
+| record | field | why |
+| --- | --- | --- |
+| `provider: yandex`, `configured-model`, plain `api` | a key field | a key typed here belongs to this record and is used first |
+| `backend: exec` | nothing | a local command has no key |
+
+Every API record has its own credential name, `STT_KEY_<ID>` by default
+(`yandex-new` → `STT_KEY_YANDEX_NEW`), written into the profile the first time so
+it does not change between runs; an `apiKeyRef` spelled out in the profile is
+never rewritten. A key resolves in this order:
+
+1. the record's own name (`apiKeyRef`);
+2. the Host model connector's credential (`OPENAI_API_KEY`, `MISTRAL_API_KEY`,
+   `GROQ_API_KEY`) — for `configured-model` only;
+3. `apiKeyEnv`;
+4. `apiKeyFile`.
+
+The duplication is deliberate: a person may configure recognition only, synthesis
+only or both, and each place stays under their control. Two routes serve the card:
+
+```
+GET  /api/speech-gate/state       → { providers: [{ id, name, provider, apiKeyRef, connectorRef, keyPresent, keySource }] }
+POST /api/speech-gate/credential  → { ref, value } → { ok, ref, present, unchanged? }
+```
+
+`keySource` is `own` (a value under this record's name), `connector` (the model
+settings answer instead) or `null`. An empty value with a stored key is
+`{ unchanged: true }` and writes nothing; a value is never returned and never
+logged — the log line carries the reference and the fact only.
+
 ## Install
 
 Pick whichever source fits the Host. All three install the same package, and
@@ -144,6 +183,11 @@ A provider that the model configuration does not include is refused with
 as the earlier OpenAI-only spelling. `baseUrl`, `apiKeyRef`, `apiKeyEnv` and
 `apiKeyFile` still override anything the table provides.
 
+The credential column is a **fallback**, not the entry's own name: the entry gets
+`STT_KEY_<ID>` from the card (see [The settings card](#the-settings-card-web)),
+and a value typed there wins. Nothing typed means the connector keeps answering,
+so an entry nobody opened the card for behaves exactly as before.
+
 ## Yandex SpeechKit (`provider: yandex`)
 
 SpeechKit is not OpenAI-compatible: no multipart, no `/audio/transcriptions`,
@@ -160,17 +204,26 @@ What the entry produces:
 | piece | value |
 | --- | --- |
 | request | `POST https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?lang=ru-RU&format=lpcm&sampleRateHertz=16000` |
-| auth | `Authorization: Api-Key <YANDEX_SPEECHKIT_API_KEY>` |
+| auth | `Authorization: Api-Key <the key stored under this record's name>` |
 | body | the samples of the incoming WAV with the 44-byte RIFF header dropped — no resampling, no re-encoding |
 | response | `{"result": "…"}` → the transcript; an empty `result` is an empty transcript, not a failure |
 | failure | `{"error_code": …, "error_message": …}` → `yandex-stt <code>: <message>` |
 
 `provider` is the only selector; `model` and `baseUrl` do not apply and are set
-to `null`. The key is the same credential the synthesizer uses, resolved through
-`ctx.credentials` under `YANDEX_SPEECHKIT_API_KEY` (`apiKeyRef`, `apiKeyEnv` and
-`apiKeyFile` still override it). Bare language hints are expanded to the codes
-the service accepts — `ru` → `ru-RU`, `en` → `en-US`, `kk` → `kk-KZ`; anything
-unknown falls back to `ru-RU`.
+to `null`. The entry has a credential name of its own — `STT_KEY_YANDEX_STT` for
+the id above — and the card writes the value under it. A profile that already
+names a shared key keeps it, and the live setup does:
+
+```yaml
+- id: yandex-stt
+  provider: yandex
+  apiKeyRef: YANDEX_SPEECHKIT_API_KEY   # the synthesizer's key, already working
+```
+
+There is no hard-wired SpeechKit name any more: the same key may be used by both
+directions, but each record decides which name it reads. Bare language hints are
+expanded to the codes the service accepts — `ru` → `ru-RU`, `en` → `en-US`,
+`kk` → `kk-KZ`; anything unknown falls back to `ru-RU`.
 
 ## Requirements
 
@@ -232,9 +285,12 @@ The key is resolved in this order: `apiKeyEnv`, then `apiKeyRef`, then
 
 ```sh
 npm test
+npm run build      # src/client/* → lib/client.js (esbuild, wrapped for the shell)
 ```
 
-Node 22+; no build step, the package ships as plain ESM.
+Node 22+. The server half is plain ESM; `lib/client.js` is the built browser half
+and is committed, because `exports["./client"]` points at it and `lib/` is in
+`files` — a package published without it installs cleanly and simply has no card.
 
 ## License
 
