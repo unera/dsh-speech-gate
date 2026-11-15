@@ -1,12 +1,14 @@
 // Configurable speechToText provider for DeepSeek Harness.
 //
-// One package, two backends, chosen by config:
+// One package, three ways to recognize speech, chosen by config:
 //
 //   api  — any OpenAI-compatible `POST /audio/transcriptions` endpoint. That
 //          covers a local whisper server (whisper.cpp, faster-whisper-server,
 //          whisper-asr-webservice) and any hosted model from the catalogue.
 //   exec — a local command (whisper-cli, faster-whisper, ...) that takes a WAV
 //          path and prints the transcript.
+//   Yandex SpeechKit — `provider: yandex`, its own endpoint and JSON shape;
+//          it is not OpenAI-compatible, so it needs a branch of its own.
 //
 // The provider registers itself into `ctx.speechToText`
 // (@deepseek-ai/dsh-experimental-speech-to-text); it never chooses a language
@@ -24,6 +26,30 @@ const DEFAULT_LANGUAGES = Object.freeze(['ru', 'en']);
 const SAMPLE_RATE = 16_000;
 const BYTES_PER_SAMPLE = 2;
 const WAV_HEADER_BYTES = 44;
+
+export const YANDEX_STT_ENDPOINT = 'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize';
+
+// SpeechKit accepts only the region-qualified codes below; a bare `ru`/`en` from
+// the Host is not one of them. `kk` maps to `kk-KZ`, not `kk-KK` — that is what
+// the service documents.
+const YANDEX_DEFAULT_LANGUAGE = 'ru-RU';
+const YANDEX_LANGUAGES = Object.freeze({
+  ru: 'ru-RU',
+  en: 'en-US',
+  de: 'de-DE',
+  es: 'es-ES',
+  fi: 'fi-FI',
+  fr: 'fr-FR',
+  he: 'he-IL',
+  it: 'it-IT',
+  kk: 'kk-KZ',
+  nl: 'nl-NL',
+  pl: 'pl-PL',
+  pt: 'pt-PT',
+  sv: 'sv-SE',
+  tr: 'tr-TR',
+  uz: 'uz-UZ',
+});
 
 function invalid(message) {
   const error = new TypeError(message);
@@ -50,6 +76,11 @@ const CONFIGURED_PROVIDERS = Object.freeze({
   mistral: { baseUrl: 'https://api.mistral.ai/v1', apiKeyRef: 'MISTRAL_API_KEY' },
   groq: { baseUrl: 'https://api.groq.com/openai/v1', apiKeyRef: 'GROQ_API_KEY' },
 });
+
+// SpeechKit is not an LLM connector: its key lives in the credentials store,
+// the same one the synthesizer uses, so `llm.listProviders()` has nothing to
+// say about it and it is resolved by name instead of by model family.
+const YANDEX_API_KEY_REF = 'YANDEX_SPEECHKIT_API_KEY';
 
 // Model families that only one provider serves, so a config can skip `provider`.
 const MODEL_FAMILIES = Object.freeze([
@@ -132,21 +163,43 @@ function normalizeProvider(input = {}) {
     throw invalid('backend must be "api", "exec" or "configured-model"');
   }
   const languages = stringList(config.languages, 'languages');
+  // `provider` is the one field that names the upstream service; `yandex`
+  // (SpeechKit) is the only one that does not speak the OpenAI transcription
+  // protocol, so it gets its own shape.
+  const providerName = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : null;
   const base = {
     backend,
-    id: requireString(config.id ?? (backend === 'api' ? 'openai-compatible' : 'local-command'), 'id'),
+    id: requireString(
+      config.id ?? (providerName === 'yandex' ? 'yandex' : backend === 'api' ? 'openai-compatible' : 'local-command'),
+      'id',
+    ),
     displayName: typeof config.name === 'string' && config.name.trim()
-      ? config.name.trim() : backend === 'api' ? 'OpenAI-compatible speech API' : 'Local speech command',
+      ? config.name.trim()
+      : providerName === 'yandex' ? 'Yandex SpeechKit' : backend === 'api' ? 'OpenAI-compatible speech API' : 'Local speech command',
     location: config.location === 'cloud' || config.location === 'host-local'
       ? config.location : backend === 'api' ? 'cloud' : 'host-local',
     languages,
     language: typeof config.language === 'string' && config.language.trim() ? config.language.trim() : null,
     timeoutMs: Number.isSafeInteger(config.timeoutMs) && config.timeoutMs > 0 ? config.timeoutMs : 120_000,
   };
+  if (backend === 'api' && providerName === 'yandex') {
+    return Object.freeze({
+      ...base,
+      provider: 'yandex',
+      // SpeechKit v1 takes raw PCM on its own endpoint and answers with its own
+      // JSON; there is no model to name and no OpenAI `baseUrl` to point at.
+      endpoint: YANDEX_STT_ENDPOINT,
+      baseUrl: null,
+      model: null,
+      apiKeyRef: typeof config.apiKeyRef === 'string' && config.apiKeyRef.trim()
+        ? config.apiKeyRef.trim() : YANDEX_API_KEY_REF,
+      apiKeyEnv: typeof config.apiKeyEnv === 'string' && config.apiKeyEnv.trim() ? config.apiKeyEnv.trim() : null,
+      apiKeyFile: typeof config.apiKeyFile === 'string' && config.apiKeyFile.trim() ? config.apiKeyFile.trim() : null,
+    });
+  }
   if (configured) {
     const model = requireString(config.model, 'model');
-    const provider = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : null;
-    const family = provider ?? MODEL_FAMILIES.find(([pattern]) => pattern.test(model))?.[1] ?? null;
+    const family = providerName ?? MODEL_FAMILIES.find(([pattern]) => pattern.test(model))?.[1] ?? null;
     const known = family ? CONFIGURED_PROVIDERS[family] : null;
     return Object.freeze({
       ...base,
@@ -241,6 +294,87 @@ export async function transcribeViaApi(options, input, signal, { fetchImpl = fet
   return typeof body?.text === 'string' ? body.text.trim() : '';
 }
 
+/**
+ * SpeechKit language code for a bare locale from the Host (`ru`, `en`, ...).
+ *
+ * The service accepts region-qualified codes only, so `ru` has to become
+ * `ru-RU`. An already qualified code is passed through; anything unknown falls
+ * back to the package default, Russian.
+ */
+export function yandexLanguage(language) {
+  if (typeof language !== 'string') return YANDEX_DEFAULT_LANGUAGE;
+  const code = language.trim();
+  if (!code) return YANDEX_DEFAULT_LANGUAGE;
+  const mapped = YANDEX_LANGUAGES[code.toLowerCase()];
+  if (mapped) return mapped;
+  if (/^[a-z]{2}-[a-z]{2}$/iu.test(code)) {
+    return `${code.slice(0, 2).toLowerCase()}-${code.slice(3).toUpperCase()}`;
+  }
+  return YANDEX_DEFAULT_LANGUAGE;
+}
+
+/**
+ * PCM payload of a WAV: drop the RIFF container, keep the samples untouched.
+ *
+ * SpeechKit wants `format=lpcm` — headerless 16 kHz mono PCM16, which is exactly
+ * what the channel already puts in the WAV, so slicing the header is enough; no
+ * resampling or re-encoding happens. Audio that is not RIFF/WAVE is assumed to
+ * be raw PCM already and passes through.
+ */
+export function wavToPcm(audio) {
+  if (!audio || audio.length === 0) return new Uint8Array(0);
+  const tag = (offset) => String.fromCharCode(audio[offset], audio[offset + 1], audio[offset + 2], audio[offset + 3]);
+  if (audio.length < 12 || tag(0) !== 'RIFF' || tag(8) !== 'WAVE') return audio;
+  if (audio.length <= WAV_HEADER_BYTES) return new Uint8Array(0);
+  const view = new DataView(audio.buffer, audio.byteOffset, audio.byteLength);
+  let offset = 12;
+  while (offset + 8 <= audio.length) {
+    const id = tag(offset);
+    const size = view.getUint32(offset + 4, true);
+    if (id === 'data') {
+      const start = offset + 8;
+      return audio.subarray(start, Math.min(audio.length, start + size));
+    }
+    offset += 8 + size + (size % 2);
+  }
+  return audio;
+}
+
+/** Ask Yandex SpeechKit for a transcript. */
+export async function transcribeViaSpeechKit(options, input, signal, { fetchImpl = fetch } = {}) {
+  const key = options.__apiKey ?? '';
+  const query = new URLSearchParams({
+    lang: yandexLanguage(input.language || options.language),
+    format: 'lpcm',
+    sampleRateHertz: String(SAMPLE_RATE),
+  });
+  const endpoint = options.endpoint ?? YANDEX_STT_ENDPOINT;
+  const response = await fetchImpl(`${endpoint}?${query}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Api-Key ${key}`,
+      'Content-Type': 'application/octet-stream',
+    },
+    body: wavToPcm(input.audio),
+    signal,
+  });
+  const raw = typeof response.text === 'function' ? await response.text() : '';
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+  // SpeechKit reports failures in the body with HTTP 200 now and then, so the
+  // error code decides, not the status alone.
+  if (!response.ok || body?.error_code !== undefined) {
+    const code = body?.error_code ?? `HTTP ${response.status}`;
+    const message = body?.error_message ?? (raw ? raw.slice(0, 200) : 'empty response');
+    throw new Error(`yandex-stt ${code}: ${message}`);
+  }
+  return typeof body?.result === 'string' ? body.result.trim() : '';
+}
+
 /** Run a local command that prints the transcript. */
 export function runCommand(options, input, signal, { spawnImpl = spawn } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-speech-'));
@@ -310,12 +444,16 @@ export function createProvider(options, ctx) {
       const apiKey = target.backend === 'api' ? await resolveApiKey(target, ctx) : '';
       if (target.backend === 'api' && !apiKey && target.apiKeyRef) {
         throw new Error(
-          `speech API key is unavailable (${target.apiKeyRef}); configure the ${target.provider ?? 'matching'} model connector in the Host`,
+          `speech API key is unavailable (${target.apiKeyRef}); ${target.provider === 'yandex'
+            ? 'add it to the Host credentials store'
+            : `configure the ${target.provider ?? 'matching'} model connector in the Host`}`,
         );
       }
-      const text = target.backend === 'api'
-        ? await transcribeViaApi({ ...target, __apiKey: apiKey }, input, signal)
-        : await runCommand(target, input, signal);
+      const text = target.backend !== 'api'
+        ? await runCommand(target, input, signal)
+        : target.provider === 'yandex'
+          ? await transcribeViaSpeechKit({ ...target, __apiKey: apiKey }, input, signal)
+          : await transcribeViaApi({ ...target, __apiKey: apiKey }, input, signal);
       return {
         text,
         audioSeconds: wavSeconds(input.audio) ?? 0,

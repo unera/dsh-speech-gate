@@ -4,13 +4,18 @@ import test from 'node:test';
 
 import {
   apply,
+  createProvider,
   resolveConfiguredProvider,
   normalizeConfig,
   resolveApiKey,
   runCommand,
   stripOutput,
   transcribeViaApi,
+  transcribeViaSpeechKit,
   wavSeconds,
+  wavToPcm,
+  yandexLanguage,
+  YANDEX_STT_ENDPOINT,
 } from '../index.mjs';
 
 /** The single provider a flat config produces. */
@@ -247,4 +252,164 @@ test('configured-model resolves provider, endpoint and credential', () => {
 
   // The alias still accepts the old spelling.
   assert.equal(one({ backend: 'configured-openai-model', model: 'gpt-4o-mini-transcribe' }).provider, 'openai');
+});
+
+test('provider yandex is selected by config and reuses the SpeechKit key', () => {
+  const options = one({ backend: 'configured-model', provider: 'yandex', language: 'ru' });
+  assert.equal(options.backend, 'api');
+  assert.equal(options.provider, 'yandex');
+  assert.equal(options.endpoint, YANDEX_STT_ENDPOINT);
+  assert.equal(options.baseUrl, null);
+  assert.equal(options.model, null);
+  assert.equal(options.apiKeyRef, 'YANDEX_SPEECHKIT_API_KEY');
+  assert.equal(options.id, 'yandex');
+  assert.equal(options.displayName, 'Yandex SpeechKit');
+  assert.equal(options.location, 'cloud');
+  // No model connector to resolve: the endpoint and the credential are fixed.
+  assert.equal(options.configured, undefined);
+
+  // A plain api entry names the provider the same way; an explicit key ref wins.
+  const plain = one({ provider: 'yandex', apiKeyRef: 'MY_SPEECHKIT_KEY' });
+  assert.equal(plain.provider, 'yandex');
+  assert.equal(plain.apiKeyRef, 'MY_SPEECHKIT_KEY');
+
+  // The registered provider is the SpeechKit one.
+  const registered = [];
+  const ctx = {
+    speechToText: { register(provider) { registered.push(provider); return () => {}; } },
+    // Same shape as the Host: the callback runs now, its result runs on dispose.
+    effect(callback) { const disposer = callback(); return () => disposer?.(); },
+  };
+  apply(ctx, { provider: 'yandex', languages: ['ru'] });
+  assert.equal(registered.length, 1);
+  assert.equal(registered[0].info.id, 'yandex');
+  assert.deepEqual(registered[0].info.languages, ['ru']);
+});
+
+test('yandex language codes are region-qualified', () => {
+  assert.equal(yandexLanguage('ru'), 'ru-RU');
+  assert.equal(yandexLanguage('en'), 'en-US');
+  assert.equal(yandexLanguage('kk'), 'kk-KZ');
+  assert.equal(yandexLanguage('RU'), 'ru-RU');
+  assert.equal(yandexLanguage('de-DE'), 'de-DE');
+  assert.equal(yandexLanguage('ru-ru'), 'ru-RU');
+  // Unknown or missing: the package default, Russian.
+  assert.equal(yandexLanguage('zz'), 'ru-RU');
+  assert.equal(yandexLanguage(''), 'ru-RU');
+  assert.equal(yandexLanguage(undefined), 'ru-RU');
+});
+
+test('the PCM payload drops the WAV header and keeps the samples', () => {
+  const wav = canonicalWav(0.2);
+  const pcm = wavToPcm(wav);
+  assert.equal(pcm.length, wav.length - 44);
+  assert.deepEqual(Buffer.from(pcm), Buffer.from(wav.subarray(44)));
+  assert.equal(Buffer.from(pcm).includes('RIFF'), false);
+  // Audio that is not a RIFF container is already raw PCM.
+  const raw = new Uint8Array(100).fill(7);
+  assert.deepEqual(Buffer.from(wavToPcm(raw)), Buffer.from(raw));
+});
+
+test('the yandex backend posts raw PCM to SpeechKit with its own auth header', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, async text() { return JSON.stringify({ result: '  привет мир  ' }); } };
+  };
+  const wav = canonicalWav(0.2);
+  const text = await transcribeViaSpeechKit(
+    { endpoint: YANDEX_STT_ENDPOINT, __apiKey: 'secret' },
+    { audio: wav, language: 'ru' },
+    undefined,
+    { fetchImpl },
+  );
+  assert.equal(text, 'привет мир');
+
+  const url = new URL(calls[0].url);
+  assert.equal(`${url.origin}${url.pathname}`, YANDEX_STT_ENDPOINT);
+  assert.equal(url.searchParams.get('lang'), 'ru-RU');
+  assert.equal(url.searchParams.get('format'), 'lpcm');
+  assert.equal(url.searchParams.get('sampleRateHertz'), '16000');
+  assert.equal(calls[0].options.method, 'POST');
+  assert.equal(calls[0].options.headers.Authorization, 'Api-Key secret');
+
+  const body = Buffer.from(calls[0].options.body);
+  assert.equal(body.length, wav.length - 44);
+  assert.equal(body.includes('RIFF'), false);
+  assert.deepEqual(body, Buffer.from(wav.subarray(44)));
+});
+
+test('a SpeechKit failure surfaces the service code and message', async () => {
+  const failing = async () => ({
+    ok: false,
+    status: 400,
+    async text() { return JSON.stringify({ error_code: 'ERR_INVALID_AUDIO', error_message: 'invalid audio' }); },
+  });
+  await assert.rejects(
+    () => transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(0.1) }, undefined, { fetchImpl: failing }),
+    (error) => {
+      assert.equal(error.message, 'yandex-stt ERR_INVALID_AUDIO: invalid audio');
+      return true;
+    },
+  );
+
+  // The error body decides even when the status says 200.
+  const sneaky = async () => ({
+    ok: true,
+    status: 200,
+    async text() { return JSON.stringify({ error_code: 'ERR_BAD_REQUEST', error_message: 'quota' }); },
+  });
+  await assert.rejects(
+    () => transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(0.1) }, undefined, { fetchImpl: sneaky }),
+    /yandex-stt ERR_BAD_REQUEST: quota/u,
+  );
+
+  // A non-JSON failure still carries the status.
+  const broken = async () => ({ ok: false, status: 502, async text() { return 'bad gateway'; } });
+  await assert.rejects(
+    () => transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(0.1) }, undefined, { fetchImpl: broken }),
+    /yandex-stt HTTP 502: bad gateway/u,
+  );
+});
+
+test('an empty SpeechKit result is an empty transcript, not an error', async () => {
+  const fetchImpl = async () => ({ ok: true, status: 200, async text() { return JSON.stringify({ result: '' }); } });
+  const text = await transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(0.1) }, undefined, { fetchImpl });
+  assert.equal(text, '');
+});
+
+test('a yandex provider resolves the shared key and hits SpeechKit', async () => {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, async text() { return JSON.stringify({ result: 'готово' }); } };
+  };
+  try {
+    const options = one({ backend: 'configured-model', provider: 'yandex', language: 'ru' });
+    const ctx = {
+      get: (service) => (service === 'credentials'
+        ? { async resolve(ref) { return { value: ref === 'YANDEX_SPEECHKIT_API_KEY' ? 'yc-key' : '' }; } }
+        : null),
+    };
+    const provider = createProvider(options, ctx);
+    const result = await provider.transcribe({ audio: canonicalWav(0.2), language: 'ru' });
+    assert.equal(result.text, 'готово');
+    assert.equal(result.audioSeconds, 0.2);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /^https:\/\/stt\.api\.cloud\.yandex\.net\/speech\/v1\/stt:recognize\?/u);
+    assert.equal(calls[0].options.headers.Authorization, 'Api-Key yc-key');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('a missing Yandex key names the credential instead of calling out', async () => {
+  const provider = createProvider(one({ provider: 'yandex' }), {
+    get: () => ({ async resolve() { return { value: '' }; } }),
+  });
+  await assert.rejects(
+    () => provider.transcribe({ audio: canonicalWav(0.1) }),
+    /YANDEX_SPEECHKIT_API_KEY/u,
+  );
 });

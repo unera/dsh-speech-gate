@@ -16,6 +16,10 @@
 #     backend: exec                      # a local command, stdin gets the WAV path
 #     command: whisper-cli
 #     args: ['-m', '/models/ggml-large-v3.bin', '-f']
+#
+#   config:
+#     provider: yandex                   # Yandex SpeechKit, key from credentials
+#     language: ru
 - insert:
     - id: dsh-speech-gate
       name: '@dr-co/dsh-speech-gate'

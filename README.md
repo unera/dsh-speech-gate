@@ -8,13 +8,14 @@ that a channel resolves before transcribing. This package registers one or more
 of them, so a host can offer a choice between a hosted model, a local whisper
 server and a local command without any channel knowing about it.
 
-Two backends, one package:
+Three shapes, one package:
 
 | backend | what it does | good for |
 | --- | --- | --- |
 | `api` | `POST {baseUrl}/audio/transcriptions` (OpenAI-compatible multipart) | hosted models, `whisper.cpp --server`, `faster-whisper-server`, `whisper-asr-webservice` |
 | `exec` | runs a command, prints the transcript on stdout | `whisper-cli` or `faster-whisper` on the same machine |
 | `configured-model` | same call as `api`, but the endpoint and key come from the model connector the Host already has | a Host whose OpenAI/Mistral model is configured once, without pasting the secret twice |
+| `provider: yandex` | `POST https://stt.api.cloud.yandex.net/speech/v1/stt:recognize` with raw PCM and an `Api-Key` header | Yandex SpeechKit, whose key the synthesizer already stores |
 
 The provider never transcodes audio: the channel already hands it canonical
 16 kHz mono PCM16 WAV, which is what every `speechToText` provider accepts.
@@ -143,6 +144,34 @@ A provider that the model configuration does not include is refused with
 as the earlier OpenAI-only spelling. `baseUrl`, `apiKeyRef`, `apiKeyEnv` and
 `apiKeyFile` still override anything the table provides.
 
+## Yandex SpeechKit (`provider: yandex`)
+
+SpeechKit is not OpenAI-compatible: no multipart, no `/audio/transcriptions`,
+its own JSON. Name it instead of a model:
+
+```yaml
+- id: yandex-stt
+  provider: yandex
+  language: ru
+```
+
+What the entry produces:
+
+| piece | value |
+| --- | --- |
+| request | `POST https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?lang=ru-RU&format=lpcm&sampleRateHertz=16000` |
+| auth | `Authorization: Api-Key <YANDEX_SPEECHKIT_API_KEY>` |
+| body | the samples of the incoming WAV with the 44-byte RIFF header dropped — no resampling, no re-encoding |
+| response | `{"result": "…"}` → the transcript; an empty `result` is an empty transcript, not a failure |
+| failure | `{"error_code": …, "error_message": …}` → `yandex-stt <code>: <message>` |
+
+`provider` is the only selector; `model` and `baseUrl` do not apply and are set
+to `null`. The key is the same credential the synthesizer uses, resolved through
+`ctx.credentials` under `YANDEX_SPEECHKIT_API_KEY` (`apiKeyRef`, `apiKeyEnv` and
+`apiKeyFile` still override it). Bare language hints are expanded to the codes
+the service accepts — `ru` → `ru-RU`, `en` → `en-US`, `kk` → `kk-KZ`; anything
+unknown falls back to `ru-RU`.
+
 ## Requirements
 
 - DeepSeek Harness `0.2.1-rc.2` or newer (the version this was tested on),
@@ -150,6 +179,7 @@ as the earlier OpenAI-only spelling. `baseUrl`, `apiKeyRef`, `apiKeyEnv` and
 - the `speechToText` service mounted in the profile —
   `@deepseek-ai/dsh-experimental-speech-to-text`;
 - for `configured-model`: the matching model connector configured in the Host;
+- for `provider: yandex`: the SpeechKit API key in the Host credentials;
 - for `exec`: the local binary the entry names.
 
 ## Agent instructions
@@ -179,13 +209,14 @@ configured and the model family is not distinctive — set `provider`.
 
 | field | backend | meaning |
 | --- | --- | --- |
-| `id` | both | provider identity shown to the host (default: `openai-compatible` / `local-command`) |
+| `id` | both | provider identity shown to the host (default: `openai-compatible` / `local-command` / `yandex`) |
+| `provider` | both | upstream service; `yandex` switches to SpeechKit, the rest speak the OpenAI protocol |
 | `name` | both | human-readable label |
 | `location` | both | `cloud` or `host-local` |
 | `languages` | both | accepted language hints (default `[ru, en]`) |
 | `language` | both | language sent when the caller omits one |
-| `baseUrl` | api | OpenAI-compatible root, without the trailing slash |
-| `model` | api, exec | model name (`{model}` is available in `args`) |
+| `baseUrl` | api | OpenAI-compatible root, without the trailing slash (not used by `yandex`) |
+| `model` | api, exec | model name (`{model}` is available in `args`; not used by `yandex`) |
 | `apiKeyRef` | api | credentials reference resolved through `ctx.credentials` |
 | `apiKeyEnv` | api | environment variable with the key |
 | `apiKeyFile` | api | file containing the key |
