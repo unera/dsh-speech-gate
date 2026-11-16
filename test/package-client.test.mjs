@@ -27,7 +27,7 @@ test('the manifest declares a web client half next to the bundle', async () => {
   const manifest = await loadJson('package.json')
 
   assert.equal(manifest.name, '@dr-co/dsh-speech-gate')
-  assert.equal(manifest.version, '0.4.2')
+  assert.equal(manifest.version, '0.4.3')
   assert.equal(manifest.dsh.bundle.patch, './cordis.patch.yml')
   assert.deepEqual(manifest.dsh.client, {
     inject: ['@deepseek-ai/dsh-client-locale', '@deepseek-ai/dsh-client-ui-settings'],

@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-16
+
+### Fixed
+
+- A long voice message is no longer refused by SpeechKit. The service caps a
+  request at 1 MB and raw PCM16/16 kHz is 32 000 B/s, so everything longer than
+  ~30 s died with `yandex-stt BAD_REQUEST: audio should be less than 1 mb` — the
+  36-second message in the report. Audio under 900 KiB of PCM is still sent
+  untouched; anything longer is compressed to OggOpus (32 kbit/s, ~147 KB for
+  36 s) and, if that is still over the ceiling, split into pieces whose
+  transcripts are joined in order.
+- A payload over the ceiling is refused before the request instead of being sent
+  to be rejected, and a missing or failing `ffmpeg` reports "the audio could not
+  be compressed" with what to do about it, never the service's own error text.
+
+### Changed
+
+- `timeoutMs` is now one budget for the whole recognition, not an unused field:
+  a recording that needs several requests cannot restart the clock per request.
+  The caller's abort signal cancels the remaining requests and the encoder.
+
 ## [0.4.2] - 2026-11-16
 
 ### Security
