@@ -27,7 +27,7 @@ test('the manifest declares a web client half next to the bundle', async () => {
   const manifest = await loadJson('package.json')
 
   assert.equal(manifest.name, '@dr-co/dsh-speech-gate')
-  assert.equal(manifest.version, '0.4.1')
+  assert.equal(manifest.version, '0.4.2')
   assert.equal(manifest.dsh.bundle.patch, './cordis.patch.yml')
   assert.deepEqual(manifest.dsh.client, {
     inject: ['@deepseek-ai/dsh-client-locale', '@deepseek-ai/dsh-client-ui-settings'],
@@ -130,6 +130,41 @@ test('the built bundle is a loader registration for this package, and it mounts'
   assert.deepEqual(dictionaries.map((entry) => entry.language).sort(), ['en', 'ru', 'zh'])
   assert.deepEqual(languages, ['ru'])
 })
+
+test('the shipped bundle patch mounts this plugin under its own id and names its provider', async () => {
+  const manifest = await loadJson('package.json')
+  const patch = readFileSync(path.join(root, manifest.dsh.bundle.patch), 'utf8')
+  const { name: pluginName } = await import('../index.mjs')
+
+  // The id is the plugin's own. Any other id mounts a second copy of the same
+  // plugin beside the one the bundle inserts — two rosters, two sets of routes.
+  assert.equal(pluginName, 'dsh-speech-gate')
+  assert.match(patch, new RegExp(`- id: ${pluginName}$`, 'mu'))
+  assert.match(patch, new RegExp(`name: '${manifest.name}'`, 'u'))
+  assert.doesNotMatch(patch, /id: speech-provider/u)
+
+  // The default row says which service it means: `model: whisper-1` alone lets the
+  // record pick OpenAI and fail at use on a Host that has no such connector.
+  assert.match(patch, /^\s+backend: configured-model$/mu)
+  assert.match(patch, /^\s+provider: openai$/mu)
+  assert.match(patch, /^\s+model: whisper-1$/mu)
+});
+
+test('the README install section matches what the package really does', async () => {
+  const readme = await readFile(path.join(root, 'README.md'), 'utf8')
+  const install = readme.slice(
+    readme.indexOf('## Install'),
+    readme.indexOf('## Reusing the Host model connector'),
+  );
+
+  // The claim this guards: "the package ships no `dsh.bundle`" was false, and the
+  // example that followed told people to insert a second copy under another id.
+  assert.doesNotMatch(install, /no `dsh\.bundle`/u);
+  assert.doesNotMatch(install, /id: speech-provider/u);
+  assert.match(install, /dsh\.bundle\.patch/u);
+  assert.match(install, /- id: dsh-speech-gate/u);
+  assert.match(install, /dsh plugin --profile <profile> add/u);
+});
 
 test('npm pack ships lib/client.js and routes.mjs — the lesson from the previous release', async () => {
   const { stdout } = await run('npm', ['pack', '--dry-run', '--json'], { cwd: root, timeout: 120_000 })

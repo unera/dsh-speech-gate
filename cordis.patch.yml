@@ -1,11 +1,17 @@
 # Bundle layer for @dr-co/dsh-speech-gate.
 #
-# Installing the package mounts this row, so the plugin shows up in the settings
-# plugin list where it can be switched off or removed like any other.
+# Installing the package mounts this row: `dsh.bundle.patch` in package.json points
+# here, the profile applies it while composing, and the plugin shows up in the
+# settings plugin list where it can be switched off or removed like any other.
 #
-# The default below reuses a transcription model from the connector you already
-# configured in the Host (`backend: configured-model`), so nothing has to be
-# duplicated here. Other shapes, all valid for this same row:
+# The default below transcribes through the model connector you already configured
+# in the Host (`backend: configured-model`), so no secret is duplicated here.
+#
+# `provider` is spelled out on purpose. `whisper-1` is an OpenAI model, and a Host
+# without that connector would otherwise carry a recognizer whose first call fails;
+# with the provider named, the record is skipped with the reason `no-connector` and
+# the rest of the roster keeps working. Change the row (or override it by the same
+# id in the profile) if you use another service — other shapes below.
 #
 #   config:
 #     backend: api                       # any OpenAI-compatible endpoint
@@ -28,4 +34,5 @@
       name: '@dr-co/dsh-speech-gate'
       config:
         backend: configured-model
+        provider: openai
         model: whisper-1

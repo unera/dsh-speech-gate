@@ -39,7 +39,7 @@ What the card offers per record:
 | --- | --- | --- |
 | `provider: yandex`, `configured-model`, plain remote `api` | key field, state, «включён» switch | a key typed here belongs to this record and is used first |
 | `backend: exec`, `api` on `127.0.0.1`/`localhost` | «локальный распознаватель, ключ не нужен», switch | such a recognizer wants no key at all |
-| a remote record with no key anywhere | grey row, `нет ключа — провайдер не используется`, no switch | it cannot work, so it is not offered to the Host |
+| a record the Host cannot use | grey row with the reason — `нет ключа — провайдер не используется`, or `не используется: в хосте не настроен коннектор модели` for a `configured-model` record without its connector — no switch | it cannot work, so it is not offered to the Host, and the line names why |
 
 The card does not look for a whisper model on disk. For `backend: exec` the model
 directory is whatever the binary itself was given, and for a local `api` server the
@@ -47,8 +47,9 @@ model lives on that server; a card guessing at either would be a confident line
 that is sometimes wrong, so it says only that the key is not needed.
 
 Only a *configured* record — one with a key (its own, the connector's, from
-`apiKeyEnv` or `apiKeyFile`) or a local one — and only an *enabled* record is
-registered into `speechToText`. A recognizer that would fail on its first attempt
+`apiKeyEnv` or `apiKeyFile`) or a local one, and for `configured-model` one whose
+connector the Host really has — and only an *enabled* record is registered into
+`speechToText`. A recognizer that would fail on its first attempt
 never reaches the picker. The card's «включён» switch writes `enabledById` into
 the profile and withdraws or returns the registration at once, through the
 disposer `speechToText.register()` answered with — no restart, no remount.
@@ -60,9 +61,10 @@ the roster is asked again when the service arrives and once more after a short
 pause. A record the store then reports as keyless is withdrawn, so the picker
 keeps only what can really transcribe. Every settle prints one diagnostic line —
 `распознаватели: <id>(enabled=…, local=…, registered=…) → <reason>` with
-`credentials-service-missing`, `no-key`, `disabled`, `not-configured`, `local`,
-`key-present` or `key-unknown` — so a recognizer missing from the picker has a
-named reason in the log.
+`credentials-service-missing`, `no-key`, `no-connector`, `disabled`,
+`not-configured`, `local`, `key-present` or `key-unknown` — so a recognizer missing
+from the picker has a named reason in the log, and the card prints the same reason
+instead of guessing one.
 
 Local records get no credential name at all: `STT_KEY_<ID>` is generated for the
 records that can use one.
@@ -83,10 +85,22 @@ only or both, and each place stays under their control. Two routes serve the car
 
 ```
 GET  /api/speech-gate/state       → { providers: [{ id, name, provider, local, enabled, configured,
-                                                    apiKeyRef, connectorRef, keyPresent, keySource }] }
+                                                    reason, apiKeyRef, connectorRef, keyPresent, keySource }] }
 POST /api/speech-gate/credential  → { ref, value } → { ok, ref, present, unchanged? }
-POST /api/speech-gate/enabled     → { id, enabled } → { ok, id, enabled, registered, saved }
+POST /api/speech-gate/enabled     → { id, enabled } → { ok, id, enabled, registered, reason, saved }
 ```
+
+`reason` is the reason word of the record's last settle (`no-key`, `no-connector`,
+`disabled`, …) or `null` when nobody asked yet: the card prints it, and a record
+that is switched on but not registered reads as
+«включён, но не зарегистрирован: <причина>» instead of «провайдер выключен».
+
+`POST /credential` writes only under a name one of the configured records owns —
+its `apiKeyRef`. A grammar-valid name that belongs to somebody else (the model
+connector's `OPENAI_API_KEY`, another plugin's secret) is refused with **403
+`unknown_ref`** before the store is touched at all: the request is well formed, it
+just asks for a secret this plugin does not drive. 400 stays for a name that is not
+a credential name at all.
 
 `keySource` is `own` (a value under this record's name), `connector` (the model
 settings answer instead) or `null`. `local` marks a recognizer on this machine;
@@ -100,77 +114,98 @@ logged — the log line carries the reference and the fact only.
 
 ## Install
 
-Pick whichever source fits the Host. All three install the same package, and
+Pick whichever source fits the Host. All four install the same package, and
 `dsh plugin` records the result in the profile's `package.json`.
 
 **From npm** — a released version, the default choice:
 
 ```sh
-dsh plugin --profile <profile> add @dr-co/dsh-speech-gate        # latest release
-dsh plugin --profile <profile> add @dr-co/dsh-speech-gate@0.1.0  # pinned, reproducible
+dsh plugin --profile <profile> add @dr-co/dsh-speech-gate          # latest release
+dsh plugin --profile <profile> add @dr-co/dsh-speech-gate@0.4.2    # pinned, reproducible
 ```
 
 **From GitHub** — no registry involved; useful when you want the current main:
 
 ```sh
-dsh plugin --profile <profile> add github:unera/dsh-speech-gate            # main branch
-dsh plugin --profile <profile> add github:unera/dsh-speech-gate#v0.1.0     # a tag
-dsh plugin --profile <profile> add github:unera/dsh-speech-gate#206fb1e    # a commit
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate             # main branch
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate#v0.4.2      # a tag
+dsh plugin --profile <profile> add github:unera/dsh-speech-gate#206fb1e     # a commit
 ```
 
-**From a local checkout** — while developing, `file:` follows your edits
-(re-run `add` after changing files, because pnpm copies the directory):
+**From a local checkout** — while developing (`file:` copies the directory, so
+re-run `add` after changing files):
 
 ```sh
 git clone https://github.com/unera/dsh-speech-gate
 dsh plugin --profile <profile> add file:$PWD/dsh-speech-gate
 ```
 
-The package ships no `dsh.bundle`, so `dsh plugin add` installs it as a plain
-dependency and the profile patch below is what actually mounts it — `dsh plugin`
-prints a warning saying exactly that.
+### It mounts itself
 
-Then mount it in the profile patch (`$DSH_HOME/profiles/<profile>/cordis.patch.yml`)
-next to the service it feeds:
+The package ships a bundle layer: `dsh.bundle.patch` in `package.json` points at
+`cordis.patch.yml`, and the profile applies that layer while composing its plugin
+tree. So `dsh plugin add` is the whole installation — the plugin appears in the
+settings plugin list under its own id `dsh-speech-gate`, where it can be switched
+off or removed like any other.
+
+**Do not insert it by hand.** A second insert under another id mounts a second copy
+of the same plugin: two rosters, two sets of routes under the same path, and one of
+them silently wins.
+
+The row the bundle inserts is this one:
 
 ```yaml
-- id: speech-to-text
-  config:
-    defaultProvider: openai-compatible
-    language: ru
 - insert:
-    - id: speech-provider
+    - id: dsh-speech-gate
       name: '@dr-co/dsh-speech-gate'
       config:
-        providers:
-          - id: openai-compatible
-            backend: configured-model
-            name: OpenAI gpt-4o-mini-transcribe
-            location: cloud
-            languages: [ru, en]
-            language: ru
-            model: gpt-4o-mini-transcribe
-          - id: mistral-voxtral
-            backend: configured-model
-            name: Mistral Voxtral
-            location: cloud
-            languages: [ru, en]
-            language: ru
-            model: voxtral-mini-latest
-          - id: whisper-local
-            backend: api
-            name: Local whisper server
-            location: host-local
-            languages: [ru, en]
-            baseUrl: http://127.0.0.1:8080/v1
-            model: whisper-1
-          - id: whisper-exec
-            backend: exec
-            name: Local whisper command
-            location: host-local
-            languages: [ru, en]
-            command: whisper-cli
-            args: ['-f', '{input}', '-l', '{language}', '-nt']
+        backend: configured-model
+        provider: openai
+        model: whisper-1
+```
+
+`configured-model` transcribes through the model connector the Host already has, so
+nothing is duplicated. `provider` is spelled out because `whisper-1` is an OpenAI
+model: on a Host without that connector the record is skipped — the diagnostic line
+and the card name the reason `no-connector` — and the rest of the roster is
+unaffected. Pick another shape (table above) if you use another service.
+
+To choose your own recognizers, override that same row by id in
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` — the profile layer is applied
+after the bundle layer:
+
+```yaml
+- id: dsh-speech-gate
+  config:
+    providers:
+      - id: openai-compatible
+        backend: configured-model
+        name: OpenAI gpt-4o-mini-transcribe
+        location: cloud
+        languages: [ru, en]
+        language: ru
+        model: gpt-4o-mini-transcribe
+      - id: mistral-voxtral
+        backend: configured-model
+        name: Mistral Voxtral
+        location: cloud
+        languages: [ru, en]
+        language: ru
+        model: voxtral-mini-latest
+      - id: whisper-local
+        backend: api
+        name: Local whisper server
+        location: host-local
+        languages: [ru, en]
+        baseUrl: http://127.0.0.1:8080/v1
+        model: whisper-1
+      - id: whisper-exec
+        backend: exec
+        name: Local whisper command
+        location: host-local
+        languages: [ru, en]
+        command: whisper-cli
+        args: ['-f', '{input}', '-l', '{language}', '-nt']
 ```
 
 Every entry becomes a selectable provider; with the optional
@@ -178,6 +213,11 @@ Every entry becomes a selectable provider; with the optional
 language) appears in the Web UI under *Plugins → Voice Input*. A flat config
 (`backend`, `baseUrl`, `model`, …) registers a single provider and is still
 supported.
+
+The consumer this plugin feeds is a separate row of its own (`speech-to-text`,
+from `@deepseek-ai/dsh-experimental-speech-to-text`), and its `defaultProvider`
+names one of the entry ids above. If a bundle already inserts that row, override it
+by id instead of inserting a second one.
 
 ## Reusing the Host model connector (`configured-model`)
 
@@ -217,9 +257,12 @@ through `llm.listProviders()`:
 4. otherwise the transcription fails with the candidate list. It never guesses:
    the wrong credential would quietly bill the wrong account.
 
-A provider that the model configuration does not include is refused with
-"has no model connector configured". `configured-openai-model` remains accepted
-as the earlier OpenAI-only spelling. `baseUrl`, `apiKeyRef`, `apiKeyEnv` and
+A provider that the Host's model configuration does not include is not offered at
+all: the record is skipped with the reason `no-connector` (the log line and the card
+say so) instead of being registered and failing on the first phrase with
+`provider "X" has no model connector configured`. A Host that does not answer —
+no `llm` service — leaves the question open, and the record stays.
+`configured-openai-model` remains accepted as the earlier OpenAI-only spelling. `baseUrl`, `apiKeyRef`, `apiKeyEnv` and
 `apiKeyFile` still override anything the table provides.
 
 The credential column is a **fallback**, not the entry's own name: the entry gets
@@ -278,12 +321,14 @@ expanded to the codes the service accepts — `ru` → `ru-RU`, `en` → `en-US`
 
 For an agent wiring this up on a Host, in order:
 
-1. `dsh plugin --profile <profile> add github:unera/dsh-speech-gate   # or @dr-co/dsh-speech-gate from npm once published`
-   (or `file:/path/to/checkout` while iterating).
-2. In `$DSH_HOME/profiles/<profile>/cordis.patch.yml`, mount the service row and
-   insert this plugin — copy the example above. If a bundle already inserts
-   `speech-to-text`, override that row (`- id: speech-to-text`) instead of
-   inserting a second one.
+1. `dsh plugin --profile <profile> add @dr-co/dsh-speech-gate` (or
+   `github:unera/dsh-speech-gate`, or `file:/path/to/checkout` while iterating).
+   That also mounts the plugin: the package carries `dsh.bundle.patch`, and a new
+   bundle dependency is activated automatically. **Do not insert the plugin row by
+   hand** — a second insert under another id runs a second copy.
+2. Make sure the `speech-to-text` service row is in the profile (its own package
+   brings it). If a bundle already inserts it, override that row
+   (`- id: speech-to-text`) instead of inserting a second one.
 3. Point `defaultProvider` at one of the entry `id`s (a name that is registered,
    otherwise the service fails the first call explicitly).
 4. `dsh --profile <profile> --dump-config | grep -A30 speech` to confirm the
