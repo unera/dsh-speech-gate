@@ -12,7 +12,6 @@ import {
   isConfigured,
   isLocalEndpoint,
   judgeRecord,
-  keyPresence,
   persistApiKeyRefs,
   persistEnabled,
   normalizeConfig,
@@ -629,20 +628,6 @@ test('applying a config persists the generated names and keeps given ones', asyn
   assert.deepEqual(updates, []);
 });
 
-test('key presence is read through ctx.get, never through the property', async () => {
-  const store = storeOf({ STT_KEY_YANDEX: 'value' });
-  const ctx = {
-    get: (service) => (service === 'credentials' ? store : null),
-    // A Host that did not mount this plugin with `credentials` in `inject` throws
-    // on the property; reading it here would turn a presence question into an error.
-    get credentials() { throw new Error('cannot get property "credentials" without inject'); },
-  };
-  assert.equal(await keyPresence('STT_KEY_YANDEX', ctx), true);
-  assert.equal(await keyPresence('STT_KEY_OTHER', ctx), false);
-  // No store at all is "no key", not a rejection.
-  assert.equal(await keyPresence('STT_KEY_YANDEX', { get: () => null }), false);
-});
-
 test('a key resolves in order: own name, connector, env, file', async () => {
   const store = storeOf({ OWN: 'from-own', CONNECTOR: 'from-connector' });
   const ctx = { get: (service) => (service === 'credentials' ? store : null) };
@@ -782,6 +767,118 @@ test('a local recognizer is configured without any key; a remote one is not', as
   }
 });
 
+test('a configured-model record is offered only when its connector is in the Host', async () => {
+  const ctxWith = (ids, values = { STT_KEY_CLOUD: 'sk-own', STT_KEY_WHISPER: 'sk-own', STT_KEY_PLAIN: 'sk-own' }) => ({
+    get: (service) => {
+      if (service === 'llm') return { listProviders: () => ids.map((id) => ({ id })) };
+      if (service === 'credentials') return storeOf(values);
+      return null;
+    },
+  });
+  const record = keyed(one({ id: 'cloud', backend: 'configured-model', provider: 'openai', model: 'gpt-4o-transcribe' }));
+
+  // A key is there, but the connector the endpoint and the key come from is not:
+  // the first call would fail with "no model connector configured", so the record
+  // is skipped with a reason of its own instead of reaching the picker.
+  assert.deepEqual(await judgeRecord(record, ctxWith(['mistral']), {}),
+    { configured: false, reason: 'no-connector' });
+  assert.deepEqual(await judgeRecord(record, ctxWith([]), {}),
+    { configured: false, reason: 'no-connector' });
+  assert.deepEqual(await judgeRecord(record, ctxWith(['openai']), {}),
+    { configured: true, reason: 'key-present' });
+
+  // A Host that answers nothing — no `llm` service at all — leaves the question
+  // open, and an open question is not a "no": the record stays (it has no store
+  // either here, which is the other open question of its own).
+  assert.deepEqual(await judgeRecord(record, { get: () => null }, {}),
+    { configured: true, reason: 'credentials-service-missing' });
+  // An `llm` service that throws answered nothing either.
+  const broken = { get: (service) => (service === 'llm'
+    ? { listProviders() { throw new Error('not ready'); } }
+    : storeOf({ STT_KEY_CLOUD: 'sk-own' })) };
+  assert.deepEqual(await judgeRecord(record, broken, {}), { configured: true, reason: 'key-present' });
+
+  // The named service comes from the model family as well: `whisper-1` is openai.
+  const whisper = keyed(one({ id: 'whisper', backend: 'configured-model', model: 'whisper-1' }));
+  assert.equal(whisper.provider, 'openai');
+  assert.deepEqual(await judgeRecord(whisper, ctxWith(['mistral']), {}),
+    { configured: false, reason: 'no-connector' });
+
+  // A plain API record has no connector behind it: its own key is all it needs,
+  // whatever the model settings say.
+  const plain = keyed(one({ id: 'plain', backend: 'api', model: 'whisper-1' }));
+  assert.deepEqual(await judgeRecord(plain, ctxWith([]), {}), { configured: true, reason: 'key-present' });
+});
+
+test('a record whose connector is missing never reaches the gate\'s roster', async () => {
+  const speechToText = liveRegistry();
+  const store = storeOf({ STT_KEY_CLOUD: 'sk-own', STT_KEY_PLAIN: 'sk-own' });
+  let connectors = ['mistral'];
+  const ctx = {
+    speechToText,
+    get: (service) => (service === 'llm' ? { listProviders: () => connectors.map((id) => ({ id })) } : null),
+  };
+  const gate = createProviderGate(ctx, { credentials: () => store, persist: async () => true });
+  const providers = assignApiKeyRefs(normalizeConfig({
+    providers: [
+      { id: 'cloud', backend: 'configured-model', provider: 'openai', model: 'gpt-4o-transcribe' },
+      { id: 'plain', backend: 'api', model: 'whisper-1' },
+    ],
+  }).providers, {}).providers;
+
+  await gate.load(providers, {});
+  assert.deepEqual([...speechToText.registered], ['plain']);
+  assert.deepEqual(gate.report().find((row) => row.id === 'cloud'),
+    { id: 'cloud', enabled: true, local: false, reason: 'no-connector', registered: false });
+  assert.equal(await gate.isConfigured('cloud'), false);
+
+  // The connector appears in the Host: no restart, the record is settled again.
+  connectors = ['mistral', 'openai'];
+  await gate.refreshAll();
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'plain']);
+});
+
+/** A registry that counts registrations: a second one overwrites the first disposer. */
+function countingRegistry() {
+  const counts = new Map();
+  const live = new Set();
+  return {
+    counts,
+    live,
+    register(provider) {
+      const id = provider.info.id;
+      const token = `${id}#${(counts.get(id) ?? 0) + 1}`;
+      counts.set(id, counts.get(id) === undefined ? 1 : counts.get(id) + 1);
+      live.add(token);
+      return async () => { live.delete(token); };
+    },
+  };
+}
+
+test('two refreshes at once register a record once and keep its disposer', async () => {
+  const speechToText = countingRegistry();
+  const values = {};
+  const gate = createProviderGate({ speechToText }, {
+    credentials: () => storeOf(values),
+    persist: async () => true,
+  });
+  await gate.load(assignApiKeyRefs(normalizeConfig({
+    providers: [{ id: 'cloud', backend: 'api', model: 'whisper-1' }],
+  }).providers, {}).providers, {});
+  assert.equal(speechToText.live.size, 0);
+
+  // The pair a live Host produces: a key just saved and the roster re-check. Both
+  // see the record unregistered before either has written it down.
+  values.STT_KEY_CLOUD = 'sk-fresh';
+  await Promise.all([gate.refreshAll(), gate.refreshAll()]);
+  assert.equal(speechToText.counts.get('cloud'), 1, 'the record was registered twice');
+  assert.equal(speechToText.live.size, 1);
+
+  // The kept disposer is the live one: disposing the gate leaves nothing behind.
+  await gate.dispose();
+  assert.equal(speechToText.live.size, 0, 'a registration lost its disposer');
+});
+
 test('the switch stored in the profile wins over the record default', () => {
   const providers = normalizeConfig({
     providers: [
@@ -870,13 +967,13 @@ test('flipping the switch registers and withdraws without a restart', async () =
 
   // Off: the Host stops being offered the recognizer, here and now.
   assert.deepEqual(await gate.setEnabled('cloud', false),
-    { enabled: false, outcome: 'unregistered', registered: false, saved: true });
+    { enabled: false, outcome: 'unregistered', registered: false, reason: 'disabled', saved: true });
   assert.deepEqual([...speechToText.registered], ['command']);
   assert.deepEqual(writes, [{ cloud: false }]);
 
   // On again: the registration comes back, and the profile keeps the answer.
   assert.deepEqual(await gate.setEnabled('cloud', true),
-    { enabled: true, outcome: 'registered', registered: true, saved: true });
+    { enabled: true, outcome: 'registered', registered: true, reason: 'key-present', saved: true });
   assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command']);
   assert.deepEqual(writes.at(-1), { cloud: true });
 

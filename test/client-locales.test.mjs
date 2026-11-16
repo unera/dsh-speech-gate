@@ -41,7 +41,10 @@ test('russian is actually translated, not copied from english', () => {
 
 test('the placeholders the card fills in exist in every language', () => {
   for (const language of languages) {
-    for (const key of ['card.keyStoredAs', 'card.connectorHint', 'card.error']) {
+    for (const key of [
+      'card.keyStoredAs', 'card.connectorHint', 'card.error',
+      'card.enabledNotRegistered', 'card.notUsedReason',
+    ]) {
       assert.match(DICTIONARIES[language][key], /\{0\}/u, `${language}.${key} has no {0}`);
     }
   }
@@ -81,6 +84,22 @@ test('the header says where the recognizer itself is chosen — in all three lan
   assert.match(DICTIONARIES.zh['card.sourceHint'], /插件/u);
   assert.match(DICTIONARIES.zh['card.sourceHint'], /语音输入/u);
   assert.match(DICTIONARIES.zh['card.sourceHint'], /识别服务/u);
+});
+
+test('every reason the host can send is translated in all three languages', () => {
+  const reasons = [
+    'no-key', 'no-connector', 'disabled', 'credentials-service-missing', 'key-unknown', 'not-configured',
+  ];
+  for (const language of languages) {
+    for (const word of reasons) {
+      const key = `reason.${word.replace(/-(\w)/gu, (_, letter) => letter.toUpperCase())}`;
+      assert.equal(typeof DICTIONARIES[language][key], 'string', `${language} has no ${key} (${word})`);
+    }
+    // "switched on, but not registered: <reason>" — the sentence the switch answer
+    // needs, because «провайдер выключен» would blame the person's own switch.
+    assert.match(DICTIONARIES[language]['card.enabledNotRegistered'], /\{0\}/u);
+    assert.match(DICTIONARIES[language]['card.enabledNotRegistered'], /включён|enabled|已启用/iu);
+  }
 });
 
 test('the local and unconfigured lines exist in every language', () => {

@@ -21,7 +21,7 @@ import { join } from 'node:path';
 
 import Schema from '@deepseek-ai/schemastery';
 
-import { CREDENTIAL_REF_PATTERN, mountRoutes, readService, refPresent } from './routes.mjs';
+import { CREDENTIAL_REF_PATTERN, mountRoutes, readService } from './routes.mjs';
 
 export const name = 'dsh-speech-gate';
 export const inject = ['speechToText'];
@@ -170,15 +170,64 @@ const MODEL_FAMILIES = Object.freeze([
   [/^gpt-4/i, 'openai'],
 ]);
 
-/** Provider ids the Host has configured right now, if the llm service is mounted. */
-function hostProviders(ctx) {
-  const llm = typeof ctx?.get === 'function' ? ctx.get('llm') : ctx?.llm;
-  if (typeof llm?.listProviders !== 'function') return [];
+/**
+ * Provider ids the Host has configured right now.
+ *
+ * `null` means nobody could be asked — the `llm` service is not mounted, or it
+ * refuses to answer — which is not the same as "no provider is configured".
+ * @param ctx - plugin context.
+ * @returns the ids, or null when the Host answered nothing.
+ */
+function hostProviderIds(ctx) {
+  let llm = null;
+  try {
+    llm = typeof ctx?.get === 'function' ? ctx.get('llm') : ctx?.llm ?? null;
+  } catch {
+    return null;
+  }
+  if (typeof llm?.listProviders !== 'function') return null;
   try {
     return llm.listProviders().map((entry) => entry?.id).filter((id) => typeof id === 'string');
   } catch {
-    return [];
+    return null;
   }
+}
+
+/** The same ids, with "nobody answered" flattened to an empty list. */
+function hostProviders(ctx) {
+  return hostProviderIds(ctx) ?? [];
+}
+
+/**
+ * Whether the model connector a `configured-model` record transcribes through is
+ * really there.
+ *
+ * `llm.listProviders()` is the only answer the Host gives about its connectors. A
+ * record whose provider is missing from it cannot transcribe at all: its endpoint
+ * and its key come from that connector, and the first call would fail with
+ * «provider "X" has no model connector configured». So it is not offered
+ * (`absent`) instead of being registered and failing under the person's finger.
+ *
+ * A Host that answered nothing — no `llm` service, or one that threw — leaves the
+ * question open (`unknown`), and an open question is not a "no": the record stays,
+ * exactly like a record whose key nobody could ask about yet.
+ * @param provider - one normalized provider with `configured: true`.
+ * @param ctx - plugin context, for `llm`.
+ * @returns `present`, `absent` or `unknown`.
+ */
+export function connectorState(provider, ctx) {
+  const ids = hostProviderIds(ctx);
+  if (ids === null) return 'unknown';
+  const known = ids.filter((id) => Object.hasOwn(CONFIGURED_PROVIDERS, id));
+  // `normalizeProvider()` already resolved the named service from `provider` or
+  // from the model family, so this is the same answer the transcription would get.
+  const named = typeof provider?.provider === 'string' && provider.provider !== '' ? provider.provider : null;
+  if (named !== null) return known.includes(named) ? 'present' : 'absent';
+  // No family in the name: the Host's own connectors are the candidates, and only
+  // one of them leaves nothing to guess. Two or more still have their explicit
+  // "cannot tell which provider" message at use, so they are not skipped here.
+  if (known.length === 0) return 'absent';
+  return known.length === 1 ? 'present' : 'unknown';
 }
 
 /**
@@ -537,6 +586,8 @@ async function keyState(provider, ctx, store) {
  *   `no-key`                      — the store answered: there is no key, and the
  *                                   recognizer would fail on the first phrase;
  *   `disabled`                    — the person switched it off; never registered;
+ *   `no-connector`                — a `configured-model` record whose model
+ *                                   connector this Host does not have;
  *   `not-configured`              — a record that cannot transcribe at all;
  *   `disposed`                    — the plugin is going away, so is the roster.
  *
@@ -554,6 +605,12 @@ export async function judgeRecord(provider, ctx, { credentials } = {}) {
   if (provider.enabled === false) return { configured: false, reason: 'disabled' };
   if (provider.local === true) return { configured: true, reason: 'local' };
   if (provider.backend !== 'api') return { configured: false, reason: 'not-configured' };
+  // A `configured-model` record has no endpoint and no key of its own: both come
+  // from the Host's model connector, so a record whose connector is not configured
+  // there cannot transcribe and must not reach the picker.
+  if (provider.configured === true && connectorState(provider, ctx) === 'absent') {
+    return { configured: false, reason: 'no-connector' };
+  }
   const store = credentials !== undefined ? credentials : readService(ctx, 'credentials');
   const state = await keyState(provider, ctx, store);
   if (state === 'present') return { configured: true, reason: 'key-present' };
@@ -622,6 +679,8 @@ export function createProviderGate(ctx, options = {}) {
   const active = new Map();
   /** id → the reason word of the last settle, for the diagnostic line. */
   const reasons = new Map();
+  /** id → the settle running (or waiting) for it, so two refreshes cannot both register. */
+  const settling = new Map();
   let overrides = {};
   let disposed = false;
 
@@ -651,19 +710,48 @@ export function createProviderGate(ctx, options = {}) {
   async function admit(provider) {
     const service = registry();
     if (service === null || typeof service.register !== 'function') return false;
-    active.set(provider.id, { dispose: service.register(createProvider(provider, ctx)) });
-    return true;
+    try {
+      active.set(provider.id, { dispose: service.register(createProvider(provider, ctx)) });
+      return true;
+    } catch (error) {
+      // A registry that refuses one record is not a reason to lose the rest of
+      // the roster: the failure is named and the record stays unregistered.
+      warn(`распознаватель ${provider.id} не зарегистрирован: ${error?.message ?? error}`);
+      return false;
+    }
   }
 
-  /** Bring one record in line with its own answers. */
-  async function settle(provider) {
+  /**
+   * Bring one record in line with its own answers, one settle per id at a time.
+   *
+   * Two settles for one id can overlap — a saved key and the periodic re-check are
+   * a normal pair — and both would see the record unregistered before either wrote
+   * `active`, register it twice and lose the first disposer. So a second settle
+   * waits for the first and reads the record again when its turn comes: the last
+   * word belongs to `records`, never to a record captured before the wait.
+   * @param provider - the record to settle.
+   * @returns `registered`, `unregistered` or `unchanged`.
+   */
+  function settle(provider) {
+    const id = provider.id;
+    const running = settling.get(id);
+    const run = (running === undefined ? Promise.resolve() : running.catch(() => {}))
+      .then(() => settleNow(records.get(id) ?? provider));
+    settling.set(id, run);
+    // Whoever takes the entry over owns it: a late finish must not drop the queue.
+    const done = () => { if (settling.get(id) === run) settling.delete(id); };
+    run.then(done, done);
+    return run;
+  }
+
+  /** One settle, against the record the gate holds right now. */
+  async function settleNow(provider) {
     const was = active.has(provider.id);
     const verdict = disposed ? { configured: false, reason: 'disposed' } : await judge(provider);
     reasons.set(provider.id, verdict.reason);
     const wanted = verdict.configured;
     if (wanted && !was) {
-      await admit(provider);
-      return 'registered';
+      return (await admit(provider)) ? 'registered' : 'unchanged';
     }
     if (!wanted && was) {
       await withdraw(provider.id);
@@ -729,10 +817,12 @@ export function createProviderGate(ctx, options = {}) {
       if (!saved) {
         warn(`переключатель ${id}: значение не легло в профиль — до перезапуска оно живёт только в памяти`);
       }
-      return { enabled, outcome, registered: active.has(id), saved };
+      return { enabled, outcome, registered: active.has(id), reason: reasons.get(id) ?? null, saved };
     },
     /** Whether this record has a live registration right now. */
     isRegistered: (id) => active.has(id),
+    /** The reason word of this record's last settle, or null when it never settled. */
+    reasonOf: (id) => reasons.get(id) ?? null,
     /**
      * The roster as diagnostics: one row per record, with the reason word of the
      * last settle. It is what `rosterLine()` turns into a log line.
@@ -762,25 +852,12 @@ export function createProviderGate(ctx, options = {}) {
     /** Withdraw every registration this gate made. */
     async dispose() {
       disposed = true;
+      // A settle already in flight would register a record after the sweep below;
+      // waiting for it first keeps the roster empty once this returns.
+      await Promise.all([...settling.values()].map((run) => run.catch(() => {})));
       for (const id of [...active.keys()]) await withdraw(id);
     },
   };
-}
-
-/**
- * Whether the store holds a value under the name one record works with.
- *
- * The same seam `resolveApiKey()` reads: `ctx.get('credentials')`, never
- * `ctx.credentials` — the property is only reachable through `inject`, so a
- * direct read throws in a Host that did not mount the plugin with it.
- * @param apiKeyRef - the record's credential name, as the config has it.
- * @param ctx - plugin context.
- * @param deps - `credentials` to bring a store instead of reading it.
- * @returns true only when a non-empty value came back.
- */
-export async function keyPresence(apiKeyRef, ctx, { credentials } = {}) {
-  const store = credentials ?? readService(ctx, 'credentials');
-  return refPresent(apiKeyRef, store);
 }
 
 /** Duration of a canonical PCM16 WAV, or null when the container is not canonical. */

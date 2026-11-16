@@ -15,6 +15,7 @@ import {
   credentialFrom,
   enabledFrom,
   mountRoutes,
+  ownRefsOf,
   refPresent,
   stateOf,
   statusOf,
@@ -122,6 +123,7 @@ test('the state lists every recognizer, local and unconfigured ones included', a
     local: false,
     enabled: true,
     configured: true,
+    reason: null,
     apiKeyRef: 'YANDEX_SPEECHKIT_API_KEY',
     connectorRef: null,
     keyPresent: true,
@@ -147,6 +149,7 @@ test('the state lists every recognizer, local and unconfigured ones included', a
     local: true,
     enabled: true,
     configured: true,
+    reason: null,
     apiKeyRef: null,
     connectorRef: null,
     keyPresent: false,
@@ -266,6 +269,46 @@ test('a name outside the store grammar is refused before it reaches the store', 
   assert.deepEqual(store.calls, []);
 });
 
+test('a grammar-valid name that is no record of ours is refused with 403', async () => {
+  const store = fakeStore({ OPENAI_API_KEY: 'sk-connector' });
+  const logs = [];
+  const handler = handlerWith(store, { log: (line) => logs.push(line) });
+
+  // `OPENAI_API_KEY` is a real credential name — the model connector's — and the
+  // card draws it as a fallback. It is not ours to write: a value planted there
+  // would be used by a service this package only reads.
+  for (const value of ['planted', '']) {
+    const answer = await post(handler, { ref: 'OPENAI_API_KEY', value });
+    assert.equal(answer.status, 403, `value ${JSON.stringify(value)} must not be written`);
+    const body = await answer.json();
+    assert.equal(body.code, 'unknown_ref');
+    assert.match(body.error, /OPENAI_API_KEY/u);
+    assert.equal(JSON.stringify(body).includes('planted'), false);
+    // The refusal happens before the store is asked anything at all: an empty
+    // value must not even answer whether that name holds a key.
+    assert.deepEqual(store.calls.filter((call) => call.ref === 'OPENAI_API_KEY'), []);
+  }
+  assert.equal(logs.join('\n').includes('planted'), false);
+  assert.doesNotMatch(logs.join('\n'), /credential OPENAI_API_KEY/u);
+
+  // A name one of our own records works with is written as before.
+  const own = await post(handler, { ref: 'STT_KEY_YANDEX_NEW', value: 'real-key' });
+  assert.equal(own.status, 200);
+  assert.deepEqual(await own.json(), { ok: true, ref: 'STT_KEY_YANDEX_NEW', present: true });
+  assert.deepEqual(store.calls.find((call) => call.op === 'set'),
+    { op: 'set', ref: 'STT_KEY_YANDEX_NEW', value: 'real-key' });
+});
+
+test('the writable names are exactly the records\' own, connector names included in the card', async () => {
+  const refs = ownRefsOf(configuredProviders());
+  assert.deepEqual([...refs].sort(), ['STT_KEY_OPENAI', 'STT_KEY_YANDEX_NEW', 'YANDEX_SPEECHKIT_API_KEY']);
+  // The connector's own credential is displayed as `connectorRef`, never written.
+  assert.equal(refs.has('OPENAI_API_KEY'), false);
+  // A local record has no name at all, so it adds nothing.
+  assert.deepEqual([...ownRefsOf([])], []);
+  assert.deepEqual([...ownRefsOf(null)], []);
+});
+
 test('a body that is not JSON, and a value that is not a string, are refused', async () => {
   const store = fakeStore({});
   const broken = await post(handlerWith(store), 'not json at all');
@@ -324,6 +367,19 @@ test('a recognizer nobody configured is not registered, and the card says why', 
   assert.equal(state.providers.every((row) => typeof row.enabled === 'boolean'), true);
 });
 
+test('the state names the reason a record is not offered', async () => {
+  const providers = configuredProviders();
+  const { gate, store } = await gateOver(providers, { YANDEX_SPEECHKIT_API_KEY: 'working-key' });
+  const handler = createHandler(providers, { credentials: () => store, gate });
+  const state = await (await get(handler)).json();
+  const reasonFor = (id) => state.providers.find((row) => row.id === id).reason;
+
+  assert.equal(reasonFor('yandex-stt'), 'key-present');
+  // The card prints this instead of reading "no key" into every grey row.
+  assert.equal(reasonFor('yandex-new'), 'no-key');
+  assert.equal(reasonFor('local-command'), 'local');
+});
+
 test('the switch withdraws a registration at once — no restart, no remount', async () => {
   const providers = configuredProviders();
   const { gate, store, speechToText, persisted } = await gateOver(providers, { YANDEX_SPEECHKIT_API_KEY: 'working-key' });
@@ -333,7 +389,7 @@ test('the switch withdraws a registration at once — no restart, no remount', a
   const off = await post(handler, { id: 'yandex-stt', enabled: false }, `${BASE_PATH}/enabled`);
   assert.equal(off.status, 200);
   assert.deepEqual(await off.json(), {
-    ok: true, id: 'yandex-stt', enabled: false, registered: false, saved: true,
+    ok: true, id: 'yandex-stt', enabled: false, registered: false, reason: 'disabled', saved: true,
   });
   // The Host is no longer offered the recognizer, and the card's next read says so.
   assert.deepEqual([...speechToText.registered], ['local-command']);
@@ -343,7 +399,9 @@ test('the switch withdraws a registration at once — no restart, no remount', a
 
   // Flipping it back returns the registration, again without a restart.
   const on = await post(handler, { id: 'yandex-stt', enabled: true }, `${BASE_PATH}/enabled`);
-  assert.deepEqual(await on.json(), { ok: true, id: 'yandex-stt', enabled: true, registered: true, saved: true });
+  assert.deepEqual(await on.json(), {
+    ok: true, id: 'yandex-stt', enabled: true, registered: true, reason: 'key-present', saved: true,
+  });
   assert.deepEqual([...speechToText.registered].sort(), ['local-command', 'yandex-stt']);
   assert.deepEqual(persisted.at(-1), { 'yandex-stt': true });
 });

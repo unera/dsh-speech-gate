@@ -34,6 +34,14 @@ export const en = {
   'card.connectorHint': 'may stay empty — the key then comes from the model settings ({0})',
   'card.error': 'Could not save: {0}',
   'card.hint': 'What to know: ',
+  'card.enabledNotRegistered': 'enabled, but not registered: {0}',
+  'card.notUsedReason': 'not used: {0}',
+  'reason.noKey': 'no key',
+  'reason.noConnector': 'the model connector is not configured in this Host',
+  'reason.disabled': 'switched off',
+  'reason.credentialsServiceMissing': 'the credentials service has not mounted yet',
+  'reason.keyUnknown': 'the credentials store did not answer',
+  'reason.notConfigured': 'this record has nothing to transcribe with',
 }
 
 export const ru = {
@@ -64,6 +72,14 @@ export const ru = {
   'card.connectorHint': 'можно не заполнять — тогда ключ берётся из настроек модели ({0})',
   'card.error': 'Не удалось сохранить: {0}',
   'card.hint': 'Что важно знать: ',
+  'card.enabledNotRegistered': 'включён, но не зарегистрирован: {0}',
+  'card.notUsedReason': 'не используется: {0}',
+  'reason.noKey': 'нет ключа',
+  'reason.noConnector': 'в хосте не настроен коннектор модели',
+  'reason.disabled': 'выключен переключателем',
+  'reason.credentialsServiceMissing': 'служба учётных данных ещё не поднялась',
+  'reason.keyUnknown': 'хранилище учётных данных не ответило',
+  'reason.notConfigured': 'этому распознавателю нечем распознавать',
 }
 
 export const zh = {
@@ -94,6 +110,14 @@ export const zh = {
   'card.connectorHint': '可以留空 — 此时密钥取自模型设置（{0}）',
   'card.error': '保存失败：{0}',
   'card.hint': '需要注意：',
+  'card.enabledNotRegistered': '已启用，但未注册：{0}',
+  'card.notUsedReason': '未被使用：{0}',
+  'reason.noKey': '没有密钥',
+  'reason.noConnector': '主机中未配置模型连接器',
+  'reason.disabled': '已被开关关闭',
+  'reason.credentialsServiceMissing': '凭据服务尚未启动',
+  'reason.keyUnknown': '凭据库没有响应',
+  'reason.notConfigured': '该识别器没有可用的识别方式',
 }
 
 export const DICTIONARIES = { en, ru, zh }

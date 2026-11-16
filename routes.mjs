@@ -131,6 +131,12 @@ export async function stateRow(provider, credentials, options = {}) {
     configured: typeof options.configured === 'function'
       ? (await options.configured(provider)) === true
       : local || keyPresent,
+    // Why it stands where it stands, when the gate can say (`no-key`,
+    // `no-connector`, `disabled`, …): the card prints that reason instead of
+    // reading "no key" into every record it does not offer.
+    reason: typeof options.reasonOf === 'function'
+      ? (options.reasonOf(provider) ?? null)
+      : null,
     // The name this record's own value belongs to — null for a local one, which
     // never gets a name at all.
     apiKeyRef: own,
@@ -158,12 +164,32 @@ export async function stateOf(providers, credentials, options = {}) {
 }
 
 /**
+ * The credential names the configured records own.
+ *
+ * A grammar-valid name is not a name that belongs to us: `OPENAI_API_KEY` is the
+ * model connector's, and `POST /credential` writing there would let the card plant
+ * a value for a service this package only reads. So the write is checked against
+ * this list — one entry per record, the `apiKeyRef` each of them works with.
+ * @param providers - the configured records, as `/state` draws them.
+ * @returns the set of names this package may write under.
+ */
+export function ownRefsOf(providers) {
+  const refs = new Set();
+  for (const provider of Array.isArray(providers) ? providers : []) {
+    const ref = provider?.apiKeyRef;
+    if (typeof ref === 'string' && ref !== '') refs.add(ref);
+  }
+  return refs;
+}
+
+/**
  * Turn an untrusted body into the reference and the value it carries.
  *
  * The value is trimmed and never logged, never echoed and never kept here: it is
  * handed to `credentials.set()` and forgotten. The reference is checked against
  * the store's own grammar before it gets there — a card sending something else is
- * a mistake, not a key.
+ * a mistake, not a key. Grammar is all this function answers; whether the name
+ * belongs to one of our records is the handler's question (`ownRefsOf`).
  *
  * The name is passed on as a plain string rather than a branded `credentialRef`:
  * this package carries no runtime dependency on the credentials package, and the
@@ -261,6 +287,11 @@ export function createHandler(providers, options = {}) {
   const configuredOf = (gate) => (typeof gate?.isConfigured === 'function'
     ? (provider) => gate.isConfigured(provider?.id)
     : undefined);
+  // The same answer for "why": the gate already recorded the reason word of its
+  // last settle, so the card does not have to guess it from "no key".
+  const reasonOf = (gate) => (typeof gate?.reasonOf === 'function'
+    ? (provider) => gate.reasonOf(provider?.id)
+    : undefined);
 
   return async function handle(request) {
     let pathname = '';
@@ -271,10 +302,21 @@ export function createHandler(providers, options = {}) {
       method = String(request.method ?? 'GET').toUpperCase();
       if (pathname === `${BASE_PATH}/state` && method === 'GET') {
         const gate = gateOf();
-        return json(200, await stateOf(await listOf(), credentialsOf(), { configured: configuredOf(gate) }));
+        return json(200, await stateOf(await listOf(), credentialsOf(), {
+          configured: configuredOf(gate),
+          reasonOf: reasonOf(gate),
+        }));
       }
       if (pathname === `${BASE_PATH}/credential` && method === 'POST') {
         const { ref, value } = credentialFrom(await bodyOf(request));
+        // The grammar says the name is a name; it does not say the name is ours.
+        // `OPENAI_API_KEY` is the model connector's, and writing under it would
+        // plant a value for a service this package only reads — so only a name one
+        // of our own records works with is written. 403, not 400: the request is
+        // well formed, it just asks for somebody else's secret.
+        if (!ownRefsOf(await listOf()).has(ref)) {
+          throw refusal(403, 'unknown_ref', `ref ${ref} не принадлежит ни одному распознавателю этой карточки`);
+        }
         const credentials = credentialsOf();
         // An empty field is the card sending the form as it stands — usually
         // because a stored key is never drawn back into the field. Two different
@@ -318,7 +360,17 @@ export function createHandler(providers, options = {}) {
         }
         // The fact, never the value: this line is a log for the operator.
         log(`распознаватель ${id}: ${enabled ? 'включён' : 'выключен'}, регистрация ${outcome.outcome}`);
-        return json(200, { ok: true, id, enabled: outcome.enabled, registered: outcome.registered, saved: outcome.saved });
+        return json(200, {
+          ok: true,
+          id,
+          enabled: outcome.enabled,
+          registered: outcome.registered,
+          // Why it is not registered, when it was asked to be: `no-key`,
+          // `no-connector`, … — the card says the reason instead of "провайдер
+          // выключен", which would be a lie about the person's own switch.
+          reason: outcome.reason ?? null,
+          saved: outcome.saved,
+        });
       }
       return json(404, { code: 'not-found', error: `нет такого маршрута: ${method} ${pathname}` });
     } catch (error) {

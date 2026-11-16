@@ -410,6 +410,75 @@ test('the key label and the key state are two elements, never one glued line', a
   assert.match(CSS, /\.dsg-key-state \{[^}]*margin-left/u);
 });
 
+test('a switched-on record that was not registered says why, not «выключен»', async () => {
+  const mounted = await mountLive({
+    getState: async () => ({ providers: [{ ...CONNECTOR, configured: false, reason: 'no-connector' }] }),
+    saveCredential: async () => ({ ok: true, present: true }),
+    // Asked to switch on, and the host could not register it: its own reason word
+    // comes back, and the card must not put «провайдер выключен» in its mouth.
+    saveEnabled: async (id) => ({ ok: true, id, enabled: true, registered: false, reason: 'no-connector', saved: true }),
+  });
+
+  mounted.render();
+  await flush();
+  const tree = mounted.render();
+  const [box] = flat(tree).filter((node) => node.props?.type === 'checkbox');
+  assert.equal(box, undefined, 'an unoffered record has no switch at all');
+
+  // The grey line names the connector, not a missing key.
+  const lines = flat(tree).filter((node) => node.props?.['data-unconfigured'] === 'true').map(textOf);
+  assert.deepEqual(lines, [DICTIONARIES.ru['card.notUsedReason'].replace('{0}', DICTIONARIES.ru['reason.noConnector'])]);
+  assert.doesNotMatch(lines.join(''), /нет ключа/u);
+});
+
+test('flipping a record on is answered with its reason when it is not registered', async () => {
+  const mounted = await mountLive({
+    getState: async () => ({ providers: [{ ...CONNECTOR, enabled: true }] }),
+    saveCredential: async () => ({ ok: true, present: true }),
+    saveEnabled: async (id) => ({ ok: true, id, enabled: true, registered: false, reason: 'no-connector', saved: true }),
+  });
+
+  mounted.render();
+  await flush();
+  const tree = mounted.render();
+  flat(tree).filter((node) => node.props?.type === 'checkbox')[0].props.onChange({ target: { checked: true } });
+  await flush();
+  const after = mounted.render();
+
+  assert.equal(
+    byClass(after, 'dsg-ok').map(textOf).join(''),
+    DICTIONARIES.ru['card.enabledNotRegistered'].replace('{0}', DICTIONARIES.ru['reason.noConnector']),
+  );
+  assert.doesNotMatch(textOf(after), /провайдер выключен/u);
+});
+
+test('an unknown reason word is shown as it came, never hidden', async () => {
+  const card = await loadCard();
+  assert.equal(card.reasonText(t, 'no-connector'), 'в хосте не настроен коннектор модели');
+  assert.equal(card.reasonText(t, 'some-new-word'), 'some-new-word');
+  assert.equal(card.reasonText(t, null), '');
+  assert.equal(card.unconfiguredText(t, { reason: null }), DICTIONARIES.ru['card.noKeyUnused']);
+  assert.equal(card.unconfiguredText(t, { reason: 'no-key' }), DICTIONARIES.ru['card.noKeyUnused']);
+});
+
+test('the boundary draws its heading from the host locale, not from a frozen line', async () => {
+  const card = await loadCard();
+  const boundary = new card.CardBoundary({ t: (key) => (key === 'nav.title' ? 'LOCALIZED TITLE' : key) });
+  boundary.state = { error: new Error('boom') };
+
+  const tree = boundary.render();
+  assert.equal(textOf(byType(tree, 'h2')[0]), 'LOCALIZED TITLE');
+  assert.match(textOf(tree), /boom/u);
+  // The failure is what a person reads: no half-translated card, and the heading
+  // is not a Russian string hardcoded here.
+  assert.doesNotMatch(textOf(tree), /Распознавание речи/u);
+
+  // The page passes the translator down, or the boundary would have none to use.
+  const page = card.SpeechGatePage({ t });
+  assert.equal(page.type, card.CardBoundary);
+  assert.equal(page.props.t, t);
+});
+
 test('the switch shows the record\'s state and asks the host to flip it', async () => {
   const card = await loadCard();
   const off = card.SpeechGateView({ t, loading: false, providers: [{ ...CONNECTOR, enabled: false }] });

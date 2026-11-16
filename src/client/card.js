@@ -54,7 +54,60 @@ export function providerRows (snapshot) {
       // nobody configured is shown greyed out: it takes no part in recognition.
       enabled: row.enabled !== false,
       configured: row.configured === true,
+      // Why the host does not offer it (`no-key`, `no-connector`, `disabled`, …),
+      // so the grey line names the real reason instead of always "no key".
+      reason: typeof row.reason === 'string' && row.reason !== '' ? row.reason : null,
     }))
+}
+
+/**
+ * The reason words the host sends, as a sentence in the card's own language.
+ *
+ * The words are the diagnostics of the server log, so they stay as they are on the
+ * wire; a word the card does not know is shown as it came instead of being hidden,
+ * because a reason nobody translated is still better than a guess.
+ * @param t - the translator of this card.
+ * @param reason - the reason word from `/state` or `/enabled`.
+ * @returns the sentence to print after a colon.
+ */
+export function reasonText (t, reason) {
+  const known = {
+    'no-key': 'reason.noKey',
+    'no-connector': 'reason.noConnector',
+    disabled: 'reason.disabled',
+    'credentials-service-missing': 'reason.credentialsServiceMissing',
+    'key-unknown': 'reason.keyUnknown',
+    'not-configured': 'reason.notConfigured',
+  }
+  const key = typeof reason === 'string' ? known[reason] : undefined
+  return key === undefined ? String(reason ?? '') : t(key)
+}
+
+/**
+ * Why a record that is switched on is not offered to the host.
+ * @param t - the translator of this card.
+ * @param reason - the reason word, or null when the host named none.
+ * @returns the sentence for the row.
+ */
+export function notRegisteredText (t, reason) {
+  return String(t('card.enabledNotRegistered')).replace('{0}', reasonText(t, reason))
+}
+
+/**
+ * The grey line under a record that takes no part in recognition.
+ *
+ * The old sentence said "no key" for every such record, which was a guess: a
+ * `configured-model` record may have a key of its own and still be useless because
+ * the Host has no such connector. So the host's reason is printed when it has one.
+ * @param t - the translator of this card.
+ * @param row - one entry of `providerRows()`.
+ * @returns the sentence under the row.
+ */
+export function unconfiguredText (t, row) {
+  const reason = typeof row?.reason === 'string' && row.reason !== '' ? row.reason : null
+  // The common case keeps its own wording: "not used: no key" would say it twice.
+  if (reason === null || reason === 'no-key') return t('card.noKeyUnused')
+  return String(t('card.notUsedReason')).replace('{0}', reasonText(t, reason))
 }
 
 /** Whether this row has a credential name to write under. */
@@ -250,7 +303,7 @@ export function SpeechGateView (props) {
           className: 'dsg-note dsg-unconfigured',
           key: 'unused',
           'data-unconfigured': 'true',
-        }, t('card.noKeyUnused')))
+        }, unconfiguredText(t, row)))
       }
       if (showsEnabledSwitch(row)) {
         fields.push(h('label', { className: 'dsg-switch', key: 'enabled' },
@@ -303,16 +356,20 @@ export class CardBoundary extends Component {
   }
 
   render () {
+    const t = typeof this.props?.t === 'function' ? this.props.t : (key) => key
     if (this.state.error === null) return this.props.children
     return h('section', { className: 'dsg' },
-      h('h2', { className: 'dsg-title' }, 'Распознавание речи'),
+      // The host's own dictionary, not a line frozen in Russian: an English or
+      // Chinese page must not grow a Russian heading exactly when it broke.
+      h('h2', { className: 'dsg-title' }, t('nav.title')),
       h('p', { className: 'dsg-error' }, messageOf(this.state.error)))
   }
 }
 
 /** The section as the host mounts it: the card inside its own boundary. */
 export function SpeechGatePage (props) {
-  return h(CardBoundary, null, h(SpeechGateCard, props))
+  // `t` travels to the boundary as well: it draws the heading when the card throws.
+  return h(CardBoundary, { t: props?.t }, h(SpeechGateCard, props))
 }
 
 /**
@@ -387,8 +444,11 @@ export function SpeechGateCard (props) {
     saveEnabled(id, enabled)
       .then((answer) => {
         const registered = answer?.registered !== false
+        const reason = typeof answer?.reason === 'string' && answer.reason !== '' ? answer.reason : null
+        // Switched on but not registered is a fact of its own: «провайдер
+        // выключен» would be the card telling a person their switch did nothing.
         say(id, 'ok', enabled
-          ? (registered ? t('card.enabledOn') : t('card.enabledOff'))
+          ? (registered ? t('card.enabledOn') : notRegisteredText(t, reason))
           : t('card.enabledOff'))
         return getState().then(apply).catch(() => {})
       })
