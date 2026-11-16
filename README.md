@@ -28,14 +28,35 @@ recognizer keys are typed somewhere sane instead of being put into the credentia
 store by hand: the card reads the state from the plugin, writes only through the
 host's authenticated `/api` channel, and never draws a stored value back.
 
+The header of the card says where the recognizer itself is chosen — «Плагины» →
+«Голосовой ввод» → «Сервис распознавания». This card configures the candidates;
+that page picks one, and a person who edits the wrong screen concludes the
+recognizer is broken.
+
 What the card offers per record:
 
-| record | field | why |
+| record | what is drawn | why |
 | --- | --- | --- |
-| `provider: yandex`, `configured-model`, plain `api` | a key field | a key typed here belongs to this record and is used first |
-| `backend: exec` | nothing | a local command has no key |
+| `provider: yandex`, `configured-model`, plain remote `api` | key field, state, «включён» switch | a key typed here belongs to this record and is used first |
+| `backend: exec`, `api` on `127.0.0.1`/`localhost` | «локальный распознаватель, ключ не нужен», switch | such a recognizer wants no key at all |
+| a remote record with no key anywhere | grey row, `нет ключа — провайдер не используется`, no switch | it cannot work, so it is not offered to the Host |
 
-Every API record has its own credential name, `STT_KEY_<ID>` by default
+The card does not look for a whisper model on disk. For `backend: exec` the model
+directory is whatever the binary itself was given, and for a local `api` server the
+model lives on that server; a card guessing at either would be a confident line
+that is sometimes wrong, so it says only that the key is not needed.
+
+Only a *configured* record — one with a key (its own, the connector's, from
+`apiKeyEnv` or `apiKeyFile`) or a local one — and only an *enabled* record is
+registered into `speechToText`. A recognizer that would fail on its first attempt
+never reaches the picker. The card's «включён» switch writes `enabledById` into
+the profile and withdraws or returns the registration at once, through the
+disposer `speechToText.register()` answered with — no restart, no remount.
+
+Local records get no credential name at all: `STT_KEY_<ID>` is generated for the
+records that can use one.
+
+Every remote API record has its own credential name, `STT_KEY_<ID>` by default
 (`yandex-new` → `STT_KEY_YANDEX_NEW`), written into the profile the first time so
 it does not change between runs; an `apiKeyRef` spelled out in the profile is
 never rewritten. A key resolves in this order:
@@ -50,12 +71,19 @@ The duplication is deliberate: a person may configure recognition only, synthesi
 only or both, and each place stays under their control. Two routes serve the card:
 
 ```
-GET  /api/speech-gate/state       → { providers: [{ id, name, provider, apiKeyRef, connectorRef, keyPresent, keySource }] }
+GET  /api/speech-gate/state       → { providers: [{ id, name, provider, local, enabled, configured,
+                                                    apiKeyRef, connectorRef, keyPresent, keySource }] }
 POST /api/speech-gate/credential  → { ref, value } → { ok, ref, present, unchanged? }
+POST /api/speech-gate/enabled     → { id, enabled } → { ok, id, enabled, registered, saved }
 ```
 
 `keySource` is `own` (a value under this record's name), `connector` (the model
-settings answer instead) or `null`. An empty value with a stored key is
+settings answer instead) or `null`. `local` marks a recognizer on this machine;
+`configured` says whether it has everything it needs, which is exactly the set the
+Host is offered. `registered` in the switch answer is what the running service did
+with the record, and `saved` is whether that answer also reached the profile —
+a Host without the settings service keeps the switch live until it restarts, and
+the card says so in the log instead of pretending. An empty value with a stored key is
 `{ unchanged: true }` and writes nothing; a value is never returned and never
 logged — the log line carries the reference and the fact only.
 
@@ -265,7 +293,8 @@ configured and the model family is not distinctive — set `provider`.
 | `id` | both | provider identity shown to the host (default: `openai-compatible` / `local-command` / `yandex`) |
 | `provider` | both | upstream service; `yandex` switches to SpeechKit, the rest speak the OpenAI protocol |
 | `name` | both | human-readable label |
-| `location` | both | `cloud` or `host-local` |
+| `enabled` | both | whether the record is registered at all (default `true`); the card's switch overrides it |
+| `location` | both | `cloud` or `host-local`; an API record on a loopback endpoint is host-local whatever it says |
 | `languages` | both | accepted language hints (default `[ru, en]`) |
 | `language` | both | language sent when the caller omits one |
 | `baseUrl` | api | OpenAI-compatible root, without the trailing slash (not used by `yandex`) |
@@ -278,8 +307,14 @@ configured and the model family is not distinctive — set `provider`.
 | `args` | exec | argument list; `{input}`, `{language}`, `{model}` are substituted |
 | `stripTimestamps` | exec | drop leading `[00:00.000 --> …]` markers (default `true`) |
 
-The key is resolved in this order: `apiKeyEnv`, then `apiKeyRef`, then
-`apiKeyFile`. A local endpoint that ignores authentication needs none.
+The key is resolved in this order: the record's own `apiKeyRef` (generated when the
+profile names none), the connector's credential, `apiKeyEnv`, then `apiKeyFile`. A
+local endpoint that ignores authentication needs none — such a record is `local`:
+it gets no generated name, and the card draws no key field for it.
+
+The card's switch lives in its own profile field, `enabledById` (`id → true/false`),
+because the settings service writes only volatile fields and a record sits inside
+the non-volatile `providers` list. A value there wins over the record's `enabled`.
 
 ## Development
 
