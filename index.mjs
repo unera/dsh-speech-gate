@@ -55,6 +55,16 @@ const SAMPLE_RATE = 16_000;
 const BYTES_PER_SAMPLE = 2;
 const WAV_HEADER_BYTES = 44;
 
+/**
+ * How long after mounting the roster is asked again.
+ *
+ * The credentials service registers itself only once it has read its document,
+ * so a record registered on "not known yet" has to be re-asked; the inject seam
+ * catches the normal case, this pause covers a Host where that event is not
+ * visible to this plugin.
+ */
+export const RECHECK_DELAY_MS = 1_500;
+
 export const YANDEX_STT_ENDPOINT = 'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize';
 
 // SpeechKit accepts only the region-qualified codes below; a bare `ru`/`en` from
@@ -482,27 +492,110 @@ export function applyEnabled(providers, stored = {}) {
 }
 
 /**
+ * What the store says about one record's key: `present`, `absent` or `unknown`.
+ *
+ * `unknown` is not `absent`: it means nobody could be asked — the credentials
+ * service has not mounted yet, or the store failed on the way. The distinction is
+ * the whole point of the state, because a service that is simply not up yet must
+ * never be read as "this record has no key".
+ * @param provider - one normalized provider.
+ * @param ctx - plugin context, for the environment and file fallbacks.
+ * @param store - the credentials service as read right now, or null.
+ * @returns `present`, `absent` or `unknown`.
+ */
+async function keyState(provider, ctx, store) {
+  // A record whose name has not been generated yet is asked about the name it
+  // would get, so the answer does not depend on when in the lifecycle it is asked.
+  const own = typeof provider.apiKeyRef === 'string' && provider.apiKeyRef !== ''
+    ? provider.apiKeyRef
+    : apiKeyRefFor(provider.id);
+  const hasStore = typeof store?.resolve === 'function';
+  let value = '';
+  try {
+    value = await resolveApiKey({ ...provider, apiKeyRef: own }, ctx, { hasCredentials: hasStore ? store : null });
+  } catch {
+    // A store that throws answered nothing: that is a question left open, not a
+    // "no". The record stays, and the provider names the missing key if it is
+    // really missing when somebody speaks.
+    return 'unknown';
+  }
+  if (value !== '') return 'present';
+  return hasStore ? 'absent' : 'unknown';
+}
+
+/**
+ * Why one record stands where it stands: the verdict the gate acts on.
+ *
+ * The reason words are the ones the diagnostic line prints, so "why is it not in
+ * the picker" is answerable from one line of the log:
+ *
+ *   `local`                       — a recognizer on this machine, no key at all;
+ *   `key-present`                 — a cloud record with a key it can use;
+ *   `credentials-service-missing` — nobody could be asked: the service has not
+ *                                   mounted yet, so the record is kept;
+ *   `key-unknown`                 — the store was there but refused to answer;
+ *   `no-key`                      — the store answered: there is no key, and the
+ *                                   recognizer would fail on the first phrase;
+ *   `disabled`                    — the person switched it off; never registered;
+ *   `not-configured`              — a record that cannot transcribe at all;
+ *   `disposed`                    — the plugin is going away, so is the roster.
+ *
+ * A record is registered unless a store positively said it has no key. An absent
+ * credentials service means "not known yet", not "no key": the Host mounts that
+ * service asynchronously, after the plugins that read it.
+ * @param provider - one normalized provider.
+ * @param ctx - plugin context, for `credentials`.
+ * @param deps - `credentials` to bring a store instead of reading it.
+ * @returns `{ configured, reason }`.
+ */
+export async function judgeRecord(provider, ctx, { credentials } = {}) {
+  if (provider === null || typeof provider !== 'object') return { configured: false, reason: 'not-configured' };
+  // The switch is the person's answer and outranks every guess about a key.
+  if (provider.enabled === false) return { configured: false, reason: 'disabled' };
+  if (provider.local === true) return { configured: true, reason: 'local' };
+  if (provider.backend !== 'api') return { configured: false, reason: 'not-configured' };
+  const store = credentials !== undefined ? credentials : readService(ctx, 'credentials');
+  const state = await keyState(provider, ctx, store);
+  if (state === 'present') return { configured: true, reason: 'key-present' };
+  if (state === 'absent') return { configured: false, reason: 'no-key' };
+  return { configured: true, reason: typeof store?.resolve === 'function' ? 'key-unknown' : 'credentials-service-missing' };
+}
+
+/**
  * Whether a record can actually transcribe.
  *
  * A local recognizer always can — it needs no key. A remote one can only when a
  * key is there: its own, the model connector's, an environment variable or a
  * file. This is the rule the Host's picker follows: a recognizer nobody configured
- * is not offered at all, so a person cannot choose something that cannot work.
+ * is not offered at all, so a person cannot choose something that cannot work —
+ * but an unanswered question is not "not configured": only a store that said "no
+ * key" withdraws a record.
  * @param provider - one normalized provider.
  * @param ctx - plugin context, for `credentials`.
  * @param deps - `credentials` to bring a store instead of reading it.
  * @returns true when the record has everything it needs.
  */
 export async function isConfigured(provider, ctx, { credentials } = {}) {
-  if (provider === null || typeof provider !== 'object') return false;
-  if (provider.local === true) return true;
-  if (provider.backend !== 'api') return false;
-  // A record whose name has not been generated yet is asked about the name it
-  // would get, so the answer does not depend on when in the lifecycle it is asked.
-  const own = typeof provider.apiKeyRef === 'string' && provider.apiKeyRef !== ''
-    ? provider.apiKeyRef
-    : apiKeyRefFor(provider.id);
-  return (await resolveApiKey({ ...provider, apiKeyRef: own }, ctx, { hasCredentials: credentials })) !== '';
+  const judged = await judgeRecord(provider, ctx, { credentials });
+  return judged.configured;
+}
+
+/**
+ * One log line saying where every record of the roster stands.
+ *
+ * This is the answer to "the picker lost a recognizer": each entry carries the
+ * switch, whether it runs here and the reason word from `judgeRecord`, so a
+ * record skipped for a key that is really missing reads differently from one
+ * skipped because the store had not mounted yet.
+ * @param rows - `gate.report()`.
+ * @returns the line, without a trailing newline.
+ */
+export function rosterLine(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return 'распознаватели: в конфиге нет ни одной записи';
+  const entries = list.map((row) => `${row?.id}(enabled=${row?.enabled === true}, local=${row?.local === true}, `
+    + `registered=${row?.registered === true}) → ${row?.reason}`);
+  return `распознаватели: ${entries.join('; ')}`;
 }
 
 /**
@@ -527,6 +620,8 @@ export function createProviderGate(ctx, options = {}) {
   const records = new Map();
   /** id → the disposer `register()` answered with. */
   const active = new Map();
+  /** id → the reason word of the last settle, for the diagnostic line. */
+  const reasons = new Map();
   let overrides = {};
   let disposed = false;
 
@@ -538,7 +633,8 @@ export function createProviderGate(ctx, options = {}) {
     }
   };
 
-  const configured = (provider) => isConfigured(provider, ctx, { credentials: credentialsOf() });
+  /** The current verdict on one record, read with the store as it is right now. */
+  const judge = (provider) => judgeRecord(provider, ctx, { credentials: credentialsOf() });
 
   async function withdraw(id) {
     const entry = active.get(id);
@@ -562,7 +658,9 @@ export function createProviderGate(ctx, options = {}) {
   /** Bring one record in line with its own answers. */
   async function settle(provider) {
     const was = active.has(provider.id);
-    const wanted = !disposed && provider.enabled !== false && await configured(provider);
+    const verdict = disposed ? { configured: false, reason: 'disposed' } : await judge(provider);
+    reasons.set(provider.id, verdict.reason);
+    const wanted = verdict.configured;
     if (wanted && !was) {
       await admit(provider);
       return 'registered';
@@ -635,10 +733,29 @@ export function createProviderGate(ctx, options = {}) {
     },
     /** Whether this record has a live registration right now. */
     isRegistered: (id) => active.has(id),
+    /**
+     * The roster as diagnostics: one row per record, with the reason word of the
+     * last settle. It is what `rosterLine()` turns into a log line.
+     * @returns `[{ id, enabled, local, reason, registered }]`, in configuration order.
+     */
+    report() {
+      const rows = [];
+      for (const record of records.values()) {
+        rows.push({
+          id: record.id,
+          enabled: record.enabled !== false,
+          local: record.local === true,
+          reason: reasons.get(record.id) ?? 'unsettled',
+          registered: active.has(record.id),
+        });
+      }
+      return rows;
+    },
     /** Whether this record has everything it needs, switch aside. */
     async isConfigured(id) {
       const provider = usable(id);
-      return provider === null ? false : configured(provider);
+      if (provider === null) return false;
+      return (await judge(provider)).configured;
     },
     /** The record as the gate holds it, switch included. */
     record: usable,
@@ -687,11 +804,14 @@ export function wavSeconds(audio) {
  * keeps transcribing exactly as before.
  * @param options - one normalized provider.
  * @param ctx - plugin context (`ctx.get('credentials')` is the seam).
- * @param deps - `hasCredentials` to bring a store instead of reading it.
+ * @param deps - `hasCredentials` to bring a store instead of reading it; `null`
+ *   states that there is no store at all, so the seam is not asked a second time.
  * @returns the key, or an empty string when there is none.
  */
 export async function resolveApiKey(options, ctx, { hasCredentials } = {}) {
-  const credentials = hasCredentials ?? (typeof ctx?.get === 'function' ? ctx.get('credentials') : null);
+  const credentials = hasCredentials !== undefined
+    ? hasCredentials
+    : (typeof ctx?.get === 'function' ? ctx.get('credentials') : null);
   const refs = [options?.apiKeyRef, options?.connectorApiKeyRef].filter(
     (ref, index, all) => typeof ref === 'string' && ref !== '' && all.indexOf(ref) === index,
   );
@@ -914,12 +1034,44 @@ export function createProvider(options, ctx) {
 }
 
 /**
+ * Run a callback once the Host has mounted the named services.
+ *
+ * `ctx.inject()` forks a fiber that waits: the callback runs as soon as every
+ * named service is there, and never in a Host that has none of them. That is the
+ * seam the roster re-check needs — the credentials service is registered by its
+ * own `Service.init` only after it has read the document, so a plugin mounting in
+ * parallel sees `null` and has to be told when the answer becomes askable.
+ * @param ctx - plugin context.
+ * @param services - the service names to wait for.
+ * @param callback - what to do once they are all mounted.
+ * @returns a disposer, or a no-op when this context cannot inject.
+ */
+function watchFor(ctx, services, callback) {
+  if (typeof ctx?.inject !== 'function') return () => {};
+  try {
+    const dispose = ctx.inject(services, () => {
+      try {
+        callback();
+      } catch (error) {
+        ctx?.logger?.warn?.(`пере-проверка не удалась: ${error?.message ?? error}`);
+      }
+    });
+    return typeof dispose === 'function' ? dispose : () => {};
+  } catch {
+    return () => {};
+  }
+}
+
+/**
  * Register every configured, enabled recognizer for the lifetime of this plugin.
  *
- * "Configured" is the whole point of the rule: a recognizer with no key at all is
- * not registered, so the Host's picker cannot offer something that would fail on
- * the first attempt. The card in the web settings talks to the routes mounted
- * here; without them it has nothing to read and nowhere to put a key or a switch.
+ * "Configured" is the whole point of the rule: a recognizer with a key the store
+ * says it does not have is not registered, so the Host's picker cannot offer
+ * something that would fail on the first attempt. A record whose key nobody could
+ * be asked about yet — the credentials service has not mounted — is registered and
+ * re-checked, because "not known yet" is not "no key". The card in the web
+ * settings talks to the routes mounted here; without them it has nothing to read
+ * and nowhere to put a key or a switch.
  */
 export function apply(ctx, config = {}) {
   const { providers } = normalizeConfig(config);
@@ -951,17 +1103,48 @@ export function apply(ctx, config = {}) {
     credentials: () => readService(ctx, 'credentials'),
     persist: (map) => persistEnabled(ctx, map),
   });
+  const log = typeof ctx?.logger?.info === 'function'
+    ? (message) => ctx.logger.info(message)
+    : (message) => console.info(`[dsh-speech-gate] ${message}`);
+  // The diagnostic line is printed when the roster settles, and again only when
+  // it really changed: "the picker lost a recognizer" is answered from the log.
+  let announced = '';
+  const announce = () => {
+    const line = rosterLine(gate.report());
+    if (line === announced) return;
+    announced = line;
+    log(line);
+  };
+  /** Re-ask the store about every record: a registration made on a guess is a guess. */
+  const recheck = () => {
+    void gate.refreshAll()
+      .then(announce)
+      .catch((error) => warn(`распознаватели не пере-проверены: ${error?.message ?? error}`));
+  };
   ctx.effect(() => {
     // Whether a record is configured is the store's answer, so the roster settles
     // asynchronously — but the effect itself is synchronous, as the Host expects.
-    void gate.load(keyed, storedEnabled).catch((error) => warn(`распознаватели не зарегистрированы: ${error?.message ?? error}`));
-    return () => { void gate.dispose(); };
+    void gate.load(keyed, storedEnabled)
+      .then(announce)
+      .catch((error) => warn(`распознаватели не зарегистрированы: ${error?.message ?? error}`));
+    // The credentials service mounts asynchronously after the plugins that read
+    // it (its `Service.init` reads the document first), so the records registered
+    // on "not known yet" have to be asked again once it is there — and once more
+    // after a short pause, for a Host whose service arrives without a lifecycle
+    // event this plugin can see. A record with no key is withdrawn then, so the
+    // picker keeps only what can really transcribe.
+    const cleanups = [watchFor(ctx, ['credentials'], recheck)];
+    const timer = setTimeout(recheck, RECHECK_DELAY_MS);
+    timer.unref?.();
+    cleanups.push(() => clearTimeout(timer));
+    return () => {
+      for (const cleanup of cleanups) {
+        try { cleanup?.(); } catch { /* already gone */ }
+      }
+      void gate.dispose();
+    };
   });
-  mountRoutes(ctx, keyed, {
-    warn,
-    log: (message) => (typeof ctx?.logger?.info === 'function' ? ctx.logger.info(message) : console.info(`[dsh-speech-gate] ${message}`)),
-    gate,
-  });
+  mountRoutes(ctx, keyed, { warn, log, gate });
 }
 
 export default Object.freeze({ name, inject, Config, apply });

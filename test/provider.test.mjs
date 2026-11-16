@@ -11,12 +11,14 @@ import {
   createProviderGate,
   isConfigured,
   isLocalEndpoint,
+  judgeRecord,
   keyPresence,
   persistApiKeyRefs,
   persistEnabled,
-  resolveConfiguredProvider,
   normalizeConfig,
   resolveApiKey,
+  resolveConfiguredProvider,
+  rosterLine,
   runCommand,
   stripOutput,
   transcribeViaApi,
@@ -195,7 +197,10 @@ test('a recognizer with no key is not registered at all', async () => {
   const ctx = {
     speechToText: { register(provider) { registered.push(provider.info.id); return async () => {}; } },
     effect: (callback) => { callback(); },
-    get: () => null,
+    // The store is mounted and answers about every name — with nothing in it.
+    // A store that has *not* mounted is a different answer, and 0.4.1 keeps the
+    // record then instead of discarding it (see the mount-order tests below).
+    get: (service) => (service === 'credentials' ? { async resolve() { return undefined; } } : null),
     logger: { warn: () => {} },
   };
   // Mistral: the config asks for it, but no key exists in the store, the
@@ -753,7 +758,15 @@ test('a local recognizer is configured without any key; a remote one is not', as
   // The command backend and a loopback API record work on their own.
   assert.equal(await isConfigured(one({ backend: 'exec', command: 'whisper-cli' }), empty), true);
   assert.equal(await isConfigured(one({ backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1' }), empty), true);
-  assert.equal(await isConfigured(one({ backend: 'api', model: 'whisper-1' }), empty), false);
+  // A cloud record while no credentials service is mounted is *not known to be
+  // unconfigured*: the service registers itself only after it has read its
+  // document, so "nobody asked yet" must not throw the record away. Changed in
+  // 0.4.1 on purpose — 0.4.0 answered `false` here and lost every cloud
+  // recognizer from the picker at startup.
+  assert.equal(await isConfigured(one({ backend: 'api', model: 'whisper-1' }), empty), true);
+  // The refusal is a store that is there and has nothing under the name.
+  const emptyStore = { get: (service) => (service === 'credentials' ? storeOf({}) : null) };
+  assert.equal(await isConfigured(one({ backend: 'api', model: 'whisper-1' }), emptyStore), false);
 
   // A key makes a remote record usable; the connector's key counts as one.
   const store = storeOf({ STT_KEY_MINE: 'sk-own', OPENAI_API_KEY: 'sk-connector' });
@@ -926,4 +939,154 @@ test('disposing the gate withdraws every registration it made', async () => {
 
   await gate.dispose();
   assert.deepEqual([...speechToText.registered], []);
+});
+
+/* ── the credentials service mounts after us ──────────────────────────────── */
+
+test('a mount before the credentials service keeps the cloud records', async () => {
+  const speechToText = liveRegistry();
+  // The Host at mount time: `credentials` is not registered yet, so nobody can
+  // say whether a key exists. That is not a "no key".
+  const gate = createProviderGate({ speechToText }, { credentials: () => null, persist: async () => true });
+  await gate.load(assignApiKeyRefs(normalizeConfig({
+    providers: [
+      { id: 'cloud', backend: 'api', model: 'whisper-1' },
+      { id: 'yandex', provider: 'yandex' },
+      { id: 'local', backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1' },
+      { id: 'command', backend: 'exec', command: 'whisper-cli' },
+    ],
+  }).providers, {}).providers, {});
+
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command', 'local', 'yandex']);
+  const rows = gate.report();
+  assert.deepEqual(rows.map((row) => [row.id, row.local, row.reason, row.registered]), [
+    ['cloud', false, 'credentials-service-missing', true],
+    ['yandex', false, 'credentials-service-missing', true],
+    ['local', true, 'local', true],
+    ['command', true, 'local', true],
+  ]);
+  // "Has everything it needs" is not a lie either: nothing said it has not.
+  assert.equal(await gate.isConfigured('cloud'), true);
+});
+
+test('when the store arrives, a record without a key really is withdrawn', async () => {
+  const speechToText = liveRegistry();
+  let store = null;
+  const gate = createProviderGate({ speechToText }, { credentials: () => store, persist: async () => true });
+  await gate.load(assignApiKeyRefs(normalizeConfig({
+    providers: [
+      { id: 'cloud', backend: 'api', model: 'whisper-1' },
+      { id: 'command', backend: 'exec', command: 'whisper-cli' },
+    ],
+  }).providers, {}).providers, {});
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command']);
+
+  // The service comes up, and there is no key under the record's own name.
+  store = storeOf({});
+  await gate.refreshAll();
+  assert.deepEqual([...speechToText.registered], ['command']);
+  assert.deepEqual(
+    gate.report().find((row) => row.id === 'cloud'),
+    { id: 'cloud', enabled: true, local: false, reason: 'no-key', registered: false },
+  );
+  assert.equal(await gate.isConfigured('cloud'), false);
+
+  // A key saved later brings it back without a restart.
+  store = storeOf({ STT_KEY_CLOUD: 'sk-later' });
+  await gate.refreshAll();
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command']);
+  assert.equal(gate.report().find((row) => row.id === 'cloud').reason, 'key-present');
+});
+
+test('a disabled record is never registered, store or no store', async () => {
+  for (const credentials of [() => null, () => storeOf({ STT_KEY_OFF: 'sk-unused' })]) {
+    const speechToText = liveRegistry();
+    const gate = createProviderGate({ speechToText }, { credentials, persist: async () => true });
+    await gate.load(assignApiKeyRefs(normalizeConfig({
+      providers: [{ id: 'off', backend: 'api', model: 'whisper-1', enabled: false }],
+    }).providers, {}).providers, {});
+    assert.deepEqual([...speechToText.registered], []);
+    // The person's switch is the reason, not a missing key.
+    assert.deepEqual(
+      gate.report().map((row) => [row.id, row.enabled, row.reason]),
+      [['off', false, 'disabled']],
+    );
+  }
+});
+
+test('the diagnostic line names every record with its reason', () => {
+  assert.equal(rosterLine([]), 'распознаватели: в конфиге нет ни одной записи');
+  assert.equal(
+    rosterLine([
+      { id: 'yandex', enabled: true, local: false, reason: 'credentials-service-missing', registered: true },
+      { id: 'off', enabled: false, local: true, reason: 'disabled', registered: false },
+    ]),
+    'распознаватели: yandex(enabled=true, local=false, registered=true) → credentials-service-missing; '
+      + 'off(enabled=false, local=true, registered=false) → disabled',
+  );
+});
+
+test('apply re-asks the roster once the credentials service is there', async () => {
+  const registered = new Set();
+  const lines = [];
+  const injects = [];
+  let store = null;
+  const ctx = {
+    // The Host at mount time: neither credentials nor settings is registered.
+    get: (service) => (service === 'credentials' ? store : null),
+    inject: (services, callback) => { injects.push({ services, callback }); return () => {}; },
+    speechToText: {
+      register(provider) {
+        registered.add(provider.info.id);
+        return async () => { registered.delete(provider.info.id); };
+      },
+    },
+    effect: (callback) => { callback(); },
+    logger: { warn: () => {}, info: (message) => lines.push(message) },
+  };
+
+  apply(ctx, {
+    providers: [
+      { id: 'yandex', provider: 'yandex' },
+      { id: 'command', backend: 'exec', command: 'whisper-cli' },
+    ],
+  });
+  await settle();
+  assert.deepEqual([...registered].sort(), ['command', 'yandex']);
+  assert.match(lines.at(-1), /yandex\(enabled=true, local=false, registered=true\) → credentials-service-missing/u);
+
+  const waiting = injects.find((entry) => entry.services.includes('credentials'));
+  assert.ok(waiting, 'the plugin waits for the credentials service instead of polling forever');
+
+  // The service comes up and has no key: the guess is corrected, and the log says
+  // why the recognizer left the picker.
+  store = storeOf({});
+  waiting.callback();
+  await settle();
+  assert.deepEqual([...registered], ['command']);
+  assert.match(lines.at(-1), /yandex\(enabled=true, local=false, registered=false\) → no-key/u);
+});
+
+test('an unasked store is not a "no key", and a switch outranks both', async () => {
+  const cloud = keyed(one({ id: 'cloud', backend: 'api', model: 'whisper-1' }));
+  // Nobody could be asked: the credentials service has not mounted.
+  assert.deepEqual(await judgeRecord(cloud, {}, { credentials: null }),
+    { configured: true, reason: 'credentials-service-missing' });
+  // A store that answers "no value under this name" is a real refusal.
+  assert.deepEqual(await judgeRecord(cloud, {}, { credentials: storeOf({}) }),
+    { configured: false, reason: 'no-key' });
+  assert.deepEqual(await judgeRecord(cloud, {}, { credentials: storeOf({ STT_KEY_CLOUD: 'sk' }) }),
+    { configured: true, reason: 'key-present' });
+  // A store that throws answered nothing: the question stays open.
+  const broken = { async resolve() { throw new Error('document not read yet'); } };
+  assert.deepEqual(await judgeRecord(cloud, {}, { credentials: broken }),
+    { configured: true, reason: 'key-unknown' });
+  // A local record needs no store; a switched-off one is never registered, even
+  // when the key is there and waiting.
+  assert.deepEqual(await judgeRecord(keyed(one({ backend: 'exec', command: 'whisper-cli' })), {}, { credentials: null }),
+    { configured: true, reason: 'local' });
+  assert.deepEqual(
+    await judgeRecord(keyed(one({ id: 'off', backend: 'api', model: 'whisper-1', enabled: false })), {}, { credentials: null }),
+    { configured: false, reason: 'disabled' },
+  );
 });

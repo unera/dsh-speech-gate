@@ -53,6 +53,17 @@ never reaches the picker. The card's «включён» switch writes `enabledBy
 the profile and withdraws or returns the registration at once, through the
 disposer `speechToText.register()` answered with — no restart, no remount.
 
+The credentials service mounts *after* the plugins that read it (its own init
+reads the document first), so at mount time nobody can say whether a key exists.
+That answer is «not known yet», not «no key»: such a record is registered, and
+the roster is asked again when the service arrives and once more after a short
+pause. A record the store then reports as keyless is withdrawn, so the picker
+keeps only what can really transcribe. Every settle prints one diagnostic line —
+`распознаватели: <id>(enabled=…, local=…, registered=…) → <reason>` with
+`credentials-service-missing`, `no-key`, `disabled`, `not-configured`, `local`,
+`key-present` or `key-unknown` — so a recognizer missing from the picker has a
+named reason in the log.
+
 Local records get no credential name at all: `STT_KEY_<ID>` is generated for the
 records that can use one.
 
