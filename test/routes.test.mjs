@@ -7,12 +7,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { assignApiKeyRefs, normalizeConfig } from '../index.mjs'
+import { applyEnabled, assignApiKeyRefs, createProviderGate, normalizeConfig } from '../index.mjs'
 import {
   BASE_PATH,
   CREDENTIAL_REF_PATTERN,
   createHandler,
   credentialFrom,
+  enabledFrom,
   mountRoutes,
   refPresent,
   stateOf,
@@ -33,7 +34,39 @@ function configuredProviders() {
       { id: 'local-command', backend: 'exec', command: 'whisper-cli' },
     ],
   });
-  return assignApiKeyRefs(providers, {}).providers;
+  return applyEnabled(assignApiKeyRefs(providers, {}).providers, {});
+}
+
+/** A `speechToText` registry that keeps what is registered right now. */
+function fakeSpeechToText() {
+  const registered = new Set();
+  return {
+    registered,
+    register(provider) {
+      if (registered.has(provider.info.id)) throw new Error(`Speech provider already registered: ${provider.info.id}`);
+      registered.add(provider.info.id);
+      // The Host's disposer is async and idempotent; both facts are relied upon.
+      return async () => { registered.delete(provider.info.id); };
+    },
+  };
+}
+
+/**
+ * A live gate over the same records the routes are given.
+ * @param providers - the configured records.
+ * @param values - what the credentials store holds.
+ * @returns the gate, the store, the registry and the profile writes.
+ */
+async function gateOver(providers, values = {}) {
+  const store = fakeStore(values);
+  const speechToText = fakeSpeechToText();
+  const persisted = [];
+  const gate = createProviderGate({ speechToText }, {
+    credentials: () => store,
+    persist: async (map) => { persisted.push({ ...map }); return true; },
+  });
+  await gate.load(providers, {});
+  return { gate, store, speechToText, persisted };
 }
 
 /**
@@ -64,45 +97,65 @@ const handlerWith = (store, options = {}) => createHandler(configuredProviders()
 
 const get = (handler) => handler(new Request(`http://localhost${BASE_PATH}/state`));
 
-const post = (handler, body) => handler(new Request(`http://localhost${BASE_PATH}/credential`, {
+const post = (handler, body, path = `${BASE_PATH}/credential`) => handler(new Request(`http://localhost${path}`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: typeof body === 'string' ? body : JSON.stringify(body),
 }));
 
-test('the state lists the records that take a key, and only those', async () => {
+test('the state lists every recognizer, local and unconfigured ones included', async () => {
   const store = fakeStore({ YANDEX_SPEECHKIT_API_KEY: 'working-key' });
   const answer = await get(handlerWith(store));
   assert.equal(answer.status, 200);
   const state = await answer.json();
 
-  assert.deepEqual(state.providers.map((row) => row.id), ['yandex-stt', 'yandex-new', 'openai']);
-  // A local command takes no key, so it is not a row at all.
-  assert.equal(state.providers.some((row) => row.id === 'local-command'), false);
+  // A local command is a row too: the card has to say "no key needed" instead of
+  // leaving a person to wonder where its key field went.
+  assert.deepEqual(state.providers.map((row) => row.id), ['yandex-stt', 'yandex-new', 'openai', 'local-command']);
 
-  const [yandex, generated, connector] = state.providers;
+  const [yandex, generated, connector, local] = state.providers;
   // The explicit name is used as it stands: a working key lives under it.
   assert.deepEqual(yandex, {
     id: 'yandex-stt',
     name: 'Yandex SpeechKit',
     provider: 'yandex',
+    local: false,
+    enabled: true,
+    configured: true,
     apiKeyRef: 'YANDEX_SPEECHKIT_API_KEY',
     connectorRef: null,
     keyPresent: true,
     keySource: 'own',
   });
-  // A record that names no key gets one derived from its own id.
+  // A record that names no key gets one derived from its own id — and stays
+  // "not configured", because no value lives under that name yet.
   assert.equal(generated.apiKeyRef, 'STT_KEY_YANDEX_NEW');
   assert.equal(generated.keyPresent, false);
   assert.equal(generated.keySource, null);
+  assert.equal(generated.configured, false);
   // A connector record has a name of its own as well, and the connector behind it.
   assert.equal(connector.apiKeyRef, 'STT_KEY_OPENAI');
   assert.deepEqual(connector.connectorRef, 'OPENAI_API_KEY');
   assert.equal(connector.keyPresent, false);
   assert.equal(connector.keySource, null);
+  assert.equal(connector.configured, false);
+  // The local one: no credential name at all, and it works.
+  assert.deepEqual(local, {
+    id: 'local-command',
+    name: 'Local speech command',
+    provider: null,
+    local: true,
+    enabled: true,
+    configured: true,
+    apiKeyRef: null,
+    connectorRef: null,
+    keyPresent: false,
+    keySource: null,
+  });
 
   // Presence is asked about exactly the names the records work with: the record's
-  // own first, the connector's only when the own name has no value.
+  // own first, the connector's only when the own name has no value. A local record
+  // has no name to ask about, so the store is not touched for it.
   assert.deepEqual(store.calls, [
     { op: 'resolve', ref: 'YANDEX_SPEECHKIT_API_KEY' },
     { op: 'resolve', ref: 'STT_KEY_YANDEX_NEW' },
@@ -143,10 +196,12 @@ test('presence reads a non-empty value, and a broken store is not an outage', as
   assert.equal(await refPresent('', fakeStore({})) , false);
 });
 
-test('without a credentials service every row says there is no key', async () => {
+test('without a credentials service every remote row says there is no key', async () => {
   const state = await stateOf(configuredProviders(), null);
-  assert.deepEqual(state.providers.map((row) => row.keyPresent), [false, false, false]);
-  assert.deepEqual(state.providers.map((row) => row.keySource), [null, null, null]);
+  assert.deepEqual(state.providers.map((row) => row.keyPresent), [false, false, false, false]);
+  assert.deepEqual(state.providers.map((row) => row.keySource), [null, null, null, null]);
+  // The local recognizer is not affected by a missing store: it needs no key.
+  assert.deepEqual(state.providers.map((row) => row.configured), [false, false, false, true]);
 });
 
 test('saving a key writes it and answers only the facts', async () => {
@@ -252,6 +307,99 @@ test('an unknown path is a 404 with the method in the sentence', async () => {
   assert.match(body.error, /POST \/api\/speech-gate\/nope/u);
 });
 
+test('a recognizer nobody configured is not registered, and the card says why', async () => {
+  const providers = configuredProviders();
+  const { gate, store, speechToText } = await gateOver(providers, { YANDEX_SPEECHKIT_API_KEY: 'working-key' });
+  const handler = createHandler(providers, { credentials: () => store, gate });
+
+  // Exactly the configured ones are offered to the Host: the keyed SpeechKit
+  // record and the local command. The two records without a key are absent, so a
+  // person cannot pick something that would fail on the first attempt.
+  assert.deepEqual([...speechToText.registered], ['yandex-stt', 'local-command']);
+
+  const state = await (await get(handler)).json();
+  const unconfigured = state.providers.filter((row) => row.configured === false);
+  assert.deepEqual(unconfigured.map((row) => row.id), ['yandex-new', 'openai']);
+  // The card draws these as a grey line with this sentence, and no switch.
+  assert.equal(state.providers.every((row) => typeof row.enabled === 'boolean'), true);
+});
+
+test('the switch withdraws a registration at once — no restart, no remount', async () => {
+  const providers = configuredProviders();
+  const { gate, store, speechToText, persisted } = await gateOver(providers, { YANDEX_SPEECHKIT_API_KEY: 'working-key' });
+  const handler = createHandler(providers, { credentials: () => store, gate });
+  assert.deepEqual([...speechToText.registered], ['yandex-stt', 'local-command']);
+
+  const off = await post(handler, { id: 'yandex-stt', enabled: false }, `${BASE_PATH}/enabled`);
+  assert.equal(off.status, 200);
+  assert.deepEqual(await off.json(), {
+    ok: true, id: 'yandex-stt', enabled: false, registered: false, saved: true,
+  });
+  // The Host is no longer offered the recognizer, and the card's next read says so.
+  assert.deepEqual([...speechToText.registered], ['local-command']);
+  assert.equal((await (await get(handler)).json()).providers[0].enabled, false);
+  // The answer was written into the profile, so it survives a restart.
+  assert.deepEqual(persisted, [{ 'yandex-stt': false }]);
+
+  // Flipping it back returns the registration, again without a restart.
+  const on = await post(handler, { id: 'yandex-stt', enabled: true }, `${BASE_PATH}/enabled`);
+  assert.deepEqual(await on.json(), { ok: true, id: 'yandex-stt', enabled: true, registered: true, saved: true });
+  assert.deepEqual([...speechToText.registered].sort(), ['local-command', 'yandex-stt']);
+  assert.deepEqual(persisted.at(-1), { 'yandex-stt': true });
+});
+
+test('a disabled record is never registered, whatever its key says', async () => {
+  const providers = applyEnabled(configuredProviders(), { 'yandex-stt': false });
+  const { gate, store, speechToText } = await gateOver(providers, { YANDEX_SPEECHKIT_API_KEY: 'working-key' });
+
+  assert.deepEqual([...speechToText.registered], ['local-command']);
+  assert.equal((await stateOf(providers, store, { configured: (provider) => gate.isConfigured(provider.id) }))
+    .providers.find((row) => row.id === 'yandex-stt').enabled, false);
+});
+
+test('a saved key makes its recognizer usable without a restart', async () => {
+  const providers = configuredProviders();
+  const { gate, store, speechToText } = await gateOver(providers, {});
+  assert.deepEqual([...speechToText.registered], ['local-command']);
+
+  const handler = createHandler(providers, { credentials: () => store, gate });
+  const answer = await post(handler, { ref: 'STT_KEY_YANDEX_NEW', value: 'fresh-key' });
+  assert.equal(answer.status, 200);
+  // The roster is brought in line right away: the person just made it work.
+  assert.deepEqual([...speechToText.registered].sort(), ['local-command', 'yandex-new']);
+  const state = await (await get(handler)).json();
+  assert.equal(state.providers.find((row) => row.id === 'yandex-new').configured, true);
+});
+
+test('the switch refuses an unknown id, a bad body and a Host without a gate', async () => {
+  const providers = configuredProviders();
+  const { gate, store } = await gateOver(providers, {});
+  const handler = createHandler(providers, { credentials: () => store, gate });
+
+  const unknown = await post(handler, { id: 'nope', enabled: false }, `${BASE_PATH}/enabled`);
+  assert.equal(unknown.status, 404);
+  assert.equal((await unknown.json()).code, 'unknown_provider');
+
+  for (const body of [{ id: '', enabled: false }, { id: 'yandex-stt' }, { id: 'yandex-stt', enabled: 'no' }, [], 'junk']) {
+    const refused = await post(handler, body, `${BASE_PATH}/enabled`);
+    assert.equal(refused.status, 400, `body ${JSON.stringify(body)} should be refused`);
+  }
+
+  // A Host that mounted no gate cannot flip anything — and says so instead of
+  // pretending the switch worked.
+  const noGate = await post(createHandler(providers, { credentials: () => store }),
+    { id: 'yandex-stt', enabled: false }, `${BASE_PATH}/enabled`);
+  assert.equal(noGate.status, 503);
+  assert.equal((await noGate.json()).code, 'gate_unavailable');
+});
+
+test('the switch body carries an id and a boolean and nothing else', () => {
+  assert.deepEqual(enabledFrom({ id: ' yandex ', enabled: true }), { id: 'yandex', enabled: true });
+  assert.throws(() => enabledFrom(null), /JSON-объектом/u);
+  assert.throws(() => enabledFrom({ id: 'x' }), /enabled/u);
+  assert.throws(() => enabledFrom({ enabled: true }), /id/u);
+});
+
 test('the credential body carries a trimmed value and nothing else', () => {
   assert.deepEqual(credentialFrom({ ref: 'STT_KEY_A', value: '  k ' }), { ref: 'STT_KEY_A', value: 'k' });
   assert.deepEqual(credentialFrom({ ref: 'STT_KEY_A' }), { ref: 'STT_KEY_A', value: '' });
@@ -290,13 +438,14 @@ test('the routes mount on the connection the Host gives, and unmount with it', (
   assert.deepEqual(registered.map((entry) => [entry.path, entry.methods]), [
     [`${BASE_PATH}/state`, ['GET']],
     [`${BASE_PATH}/credential`, ['POST']],
+    [`${BASE_PATH}/enabled`, ['POST']],
   ]);
   assert.ok(registered.every((entry) => typeof entry.fetch === 'function'));
 
-  // Unloading the plugin takes both routes with it.
+  // Unloading the plugin takes every route with it.
   assert.equal(typeof disposer, 'function');
   disposer();
-  assert.deepEqual(disposed.sort(), [`${BASE_PATH}/credential`, `${BASE_PATH}/state`]);
+  assert.deepEqual(disposed.sort(), [`${BASE_PATH}/credential`, `${BASE_PATH}/enabled`, `${BASE_PATH}/state`]);
 });
 
 test('a Host without a connection service warns once and stays harmless', () => {

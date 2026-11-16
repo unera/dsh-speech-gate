@@ -5,10 +5,15 @@ import test from 'node:test';
 import {
   apply,
   apiKeyRefFor,
+  applyEnabled,
   assignApiKeyRefs,
   createProvider,
+  createProviderGate,
+  isConfigured,
+  isLocalEndpoint,
   keyPresence,
   persistApiKeyRefs,
+  persistEnabled,
   resolveConfiguredProvider,
   normalizeConfig,
   resolveApiKey,
@@ -149,7 +154,7 @@ test('a failing command rejects with its exit code', async () => {
   );
 });
 
-test('the plugin registers one provider and disposes it with the effect', () => {
+test('the plugin registers one provider and disposes it with the effect', async () => {
   const registered = [];
   let disposed = 0;
   const disposers = [];
@@ -157,7 +162,7 @@ test('the plugin registers one provider and disposes it with the effect', () => 
     speechToText: {
       register(provider) {
         registered.push(provider);
-        return () => { disposed += 1; };
+        return async () => { disposed += 1; };
       },
     },
     // Same shape as the Host: the callback runs now, its result runs on dispose.
@@ -166,16 +171,57 @@ test('the plugin registers one provider and disposes it with the effect', () => 
       disposers.push(disposer);
       return () => disposer?.();
     },
+    // The record is only registered because a key is there to use.
+    get: (service) => (service === 'credentials'
+      ? { async resolve(ref) { return { value: ref === 'STT_KEY_OPENAI_COMPATIBLE' ? 'sk-key' : '' }; } }
+      : null),
     logger: { warn: () => {} },
   };
   apply(ctx, { backend: 'api', model: 'whisper-1', languages: ['ru'] });
+  // Registration follows a presence check, so it settles asynchronously.
+  await settle();
   assert.equal(registered.length, 1);
   assert.equal(registered[0].info.id, 'openai-compatible');
   assert.equal(registered[0].info.languages[0], 'ru');
   assert.equal(typeof registered[0].transcribe, 'function');
   assert.equal(disposed, 0);
   disposers[0]();
+  await settle();
   assert.equal(disposed, 1);
+});
+
+test('a recognizer with no key is not registered at all', async () => {
+  const registered = [];
+  const ctx = {
+    speechToText: { register(provider) { registered.push(provider.info.id); return async () => {}; } },
+    effect: (callback) => { callback(); },
+    get: () => null,
+    logger: { warn: () => {} },
+  };
+  // Mistral: the config asks for it, but no key exists in the store, the
+  // environment or a file, so registering it would offer the Host a recognizer
+  // that fails on its first attempt.
+  apply(ctx, { backend: 'configured-model', provider: 'mistral', model: 'voxtral-mini-latest' });
+  await settle();
+  assert.deepEqual(registered, []);
+});
+
+test('a disabled record is not registered even with a working key', async () => {
+  const registered = [];
+  const ctx = {
+    speechToText: { register(provider) { registered.push(provider.info.id); return async () => {}; } },
+    effect: (callback) => { callback(); },
+    get: (service) => (service === 'credentials' ? { async resolve() { return { value: 'sk-key' }; } } : null),
+    logger: { warn: () => {} },
+  };
+  apply(ctx, { backend: 'api', model: 'whisper-1', id: 'mine', enabled: false });
+  await settle();
+  assert.deepEqual(registered, []);
+
+  // The same record with the switch on is offered.
+  apply(ctx, { backend: 'api', model: 'whisper-1', id: 'mine', enabled: true });
+  await settle();
+  assert.deepEqual(registered, ['mine']);
 });
 
 test('api keys resolve from env, credentials and a file', async () => {
@@ -194,12 +240,16 @@ test('api keys resolve from env, credentials and a file', async () => {
   );
 });
 
-test('a providers list registers every configured recognizer', () => {
+test('a providers list registers every configured recognizer — local ones need no key', async () => {
   const ids = [];
   const disposers = [];
   const ctx = {
-    speechToText: { register(provider) { ids.push(provider.info.id); return () => {}; } },
+    speechToText: { register(provider) { ids.push(provider.info.id); return async () => {}; } },
     effect(callback) { const disposer = callback(); disposers.push(disposer); return () => disposer?.(); },
+    // Only the cloud record has a key; the two local ones do not need one.
+    get: (service) => (service === 'credentials'
+      ? { async resolve(ref) { return { value: ref === 'STT_KEY_OPENAI_COMPATIBLE' ? 'sk-key' : '' }; } }
+      : null),
     logger: { warn: () => {} },
   };
   apply(ctx, {
@@ -209,6 +259,7 @@ test('a providers list registers every configured recognizer', () => {
       { id: 'whisper-exec', backend: 'exec', command: 'whisper-cli', args: ['-f', '{input}'] },
     ],
   });
+  await settle();
   assert.deepEqual(ids, ['openai-compatible', 'whisper-local', 'whisper-exec']);
   assert.throws(() => normalizeConfig({ providers: [] }), /providers must be a non-empty array/u);
   assert.throws(() => normalizeConfig({
@@ -269,7 +320,7 @@ test('configured-model resolves provider, endpoint and credential', () => {
   assert.equal(one({ backend: 'configured-openai-model', model: 'gpt-4o-mini-transcribe' }).provider, 'openai');
 });
 
-test('provider yandex is selected by config and owns its key name', () => {
+test('provider yandex is selected by config and owns its key name', async () => {
   const options = one({ backend: 'configured-model', provider: 'yandex', language: 'ru' });
   assert.equal(options.backend, 'api');
   assert.equal(options.provider, 'yandex');
@@ -292,14 +343,19 @@ test('provider yandex is selected by config and owns its key name', () => {
   assert.equal(plain.provider, 'yandex');
   assert.equal(plain.apiKeyRef, 'MY_SPEECHKIT_KEY');
 
-  // The registered provider is the SpeechKit one.
+  // The registered provider is the SpeechKit one — registered because a key for
+  // it exists, which is what makes SpeechKit usable at all.
   const registered = [];
   const ctx = {
-    speechToText: { register(provider) { registered.push(provider); return () => {}; } },
+    speechToText: { register(provider) { registered.push(provider); return async () => {}; } },
     // Same shape as the Host: the callback runs now, its result runs on dispose.
     effect(callback) { const disposer = callback(); return () => disposer?.(); },
+    get: (service) => (service === 'credentials'
+      ? { async resolve(ref) { return { value: ref === 'STT_KEY_YANDEX' ? 'yc-key' : '' }; } }
+      : null),
   };
   apply(ctx, { provider: 'yandex', languages: ['ru'] });
+  await settle();
   assert.equal(registered.length, 1);
   assert.equal(registered[0].info.id, 'yandex');
   assert.deepEqual(registered[0].info.languages, ['ru']);
@@ -468,7 +524,7 @@ test('a credential name is derived from the record id', () => {
   assert.equal([...apiKeyRefFor('x'.repeat(90))].length, 64);
 });
 
-test('every API record gets a name of its own, and a local command gets none', () => {
+test('every remote API record gets a name of its own, and a local one gets none', () => {
   const { providers, added } = assignApiKeyRefs(normalizeConfig({
     providers: [
       // Explicit: a working key already lives under this name.
@@ -485,16 +541,18 @@ test('every API record gets a name of its own, and a local command gets none', (
     'YANDEX_SPEECHKIT_API_KEY',
     'STT_KEY_YANDEX_NEW',
     'STT_KEY_OPENAI_TRANSCRIBE',
-    'STT_KEY_WHISPER_LOCAL',
-    // A command takes no key, so it has no name to generate.
+    // A whisper server on this machine takes no key, so it gets no name: a name
+    // nobody fills in is what made the card show a field for a key that is not
+    // needed — and made `STT_KEY_WHISPER_LOCAL` appear in the profile.
+    null,
     null,
   ]);
+  assert.deepEqual(providers.map((provider) => provider.local), [false, false, false, true, true]);
   // Only the generated ones are news for the profile; the explicit one is not ours
   // to rewrite.
   assert.deepEqual(added, {
     'yandex-new': 'STT_KEY_YANDEX_NEW',
     'openai-transcribe': 'STT_KEY_OPENAI_TRANSCRIBE',
-    'whisper-local': 'STT_KEY_WHISPER_LOCAL',
   });
   // The connector name stays where it belongs: on the record, as a fallback.
   assert.equal(providers[2].connectorApiKeyRef, 'OPENAI_API_KEY');
@@ -656,10 +714,12 @@ test('a local endpoint with no key transcribes without an Authorization header',
     return { ok: true, status: 200, async json() { return { text: 'локально' }; } };
   };
   try {
-    // A generated name must not turn into a requirement: a whisper server next
-    // door usually wants no key, and this record keeps working without one.
+    // A local record never gets a name and never needs a key: nothing about it is
+    // a requirement, and the card draws no key field for it at all.
     const options = keyed(one({ backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1', model: 'whisper-1', location: 'host-local' }));
-    assert.equal(options.apiKeyRef, 'STT_KEY_OPENAI_COMPATIBLE');
+    assert.equal(options.apiKeyRef, null);
+    assert.equal(options.local, true);
+    assert.equal(options.location, 'host-local');
     assert.equal(options.keyRequired, false);
     const ctx = { get: (service) => (service === 'credentials' ? storeOf({}) : null) };
 
@@ -670,4 +730,200 @@ test('a local endpoint with no key transcribes without an Authorization header',
   } finally {
     globalThis.fetch = original;
   }
+});
+
+/* ── local records, the switch and the live roster ─────────────────────────── */
+
+test('a loopback endpoint is recognised, a remote one is not', () => {
+  assert.equal(isLocalEndpoint('http://127.0.0.1:8080/v1'), true);
+  assert.equal(isLocalEndpoint('http://localhost:8080/v1'), true);
+  assert.equal(isLocalEndpoint('https://LOCALHOST/v1'), true);
+  assert.equal(isLocalEndpoint('http://[::1]:8080/v1'), true);
+  // The endpoint may come without a scheme, as a bare host:port.
+  assert.equal(isLocalEndpoint('127.0.0.1:8080'), true);
+  assert.equal(isLocalEndpoint('https://api.openai.com/v1'), false);
+  assert.equal(isLocalEndpoint('http://192.168.1.5:8080/v1'), false);
+  assert.equal(isLocalEndpoint(''), false);
+  assert.equal(isLocalEndpoint(undefined), false);
+  assert.equal(isLocalEndpoint('not a url at all ::'), false);
+});
+
+test('a local recognizer is configured without any key; a remote one is not', async () => {
+  const empty = { get: () => null };
+  // The command backend and a loopback API record work on their own.
+  assert.equal(await isConfigured(one({ backend: 'exec', command: 'whisper-cli' }), empty), true);
+  assert.equal(await isConfigured(one({ backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1' }), empty), true);
+  assert.equal(await isConfigured(one({ backend: 'api', model: 'whisper-1' }), empty), false);
+
+  // A key makes a remote record usable; the connector's key counts as one.
+  const store = storeOf({ STT_KEY_MINE: 'sk-own', OPENAI_API_KEY: 'sk-connector' });
+  const ctx = { get: (service) => (service === 'credentials' ? store : null) };
+  assert.equal(await isConfigured(one({ backend: 'api', model: 'whisper-1', id: 'mine' }), ctx), true);
+  assert.equal(await isConfigured(one({ backend: 'configured-model', provider: 'openai', model: 'gpt-4o-transcribe' }), ctx), true);
+  // An environment key counts too: it is a key the recognizer will use.
+  process.env.DSH_SPEECH_LOCAL_TEST = 'from-env';
+  try {
+    assert.equal(await isConfigured(one({ backend: 'api', model: 'w', id: 'other', apiKeyEnv: 'DSH_SPEECH_LOCAL_TEST' }), empty), true);
+  } finally {
+    delete process.env.DSH_SPEECH_LOCAL_TEST;
+  }
+});
+
+test('the switch stored in the profile wins over the record default', () => {
+  const providers = normalizeConfig({
+    providers: [
+      { id: 'on', backend: 'api', model: 'w' },
+      { id: 'declared-off', backend: 'api', model: 'w', enabled: false },
+      { id: 'flipped-on', backend: 'exec', command: 'x', enabled: false },
+    ],
+  }).providers;
+
+  const resolved = applyEnabled(providers, { 'declared-off': true, 'flipped-on': true });
+  assert.deepEqual(resolved.map((provider) => provider.enabled), [true, true, true]);
+  // Nothing changed: the same objects come back, so a re-read costs nothing.
+  assert.equal(applyEnabled(providers, {})[0], providers[0]);
+  assert.equal(applyEnabled(providers, null)[1].enabled, false);
+});
+
+test('the switch is written into the profile as its own volatile map', async () => {
+  const updates = [];
+  const ctx = {
+    get: (service) => (service === 'settings'
+      ? { async update(entryId, patch) { updates.push({ entryId, patch }); } }
+      : null),
+    fiber: { entry: { options: { id: 'dsh-speech-gate' } } },
+  };
+  assert.equal(await persistEnabled(ctx, { 'yandex-stt': false }), true);
+  assert.deepEqual(updates, [{
+    entryId: 'dsh-speech-gate',
+    patch: { enabledById: { 'yandex-stt': false } },
+  }]);
+  // No settings service, no profile entry — nothing to write into.
+  assert.equal(await persistEnabled({ get: () => null, fiber: { entry: { options: { id: 'x' } } } }, {}), false);
+});
+
+/** A `speechToText` registry that keeps what is registered right now. */
+function liveRegistry() {
+  const registered = new Set();
+  return {
+    registered,
+    register(provider) {
+      if (registered.has(provider.info.id)) throw new Error(`Speech provider already registered: ${provider.info.id}`);
+      registered.add(provider.info.id);
+      return async () => { registered.delete(provider.info.id); };
+    },
+  };
+}
+
+test('the gate registers the configured records and nothing else', async () => {
+  const speechToText = liveRegistry();
+  const store = storeOf({ STT_KEY_CLOUD: 'sk-key' });
+  const gate = createProviderGate({ speechToText }, {
+    credentials: () => store,
+    persist: async () => true,
+  });
+  const providers = normalizeConfig({
+    providers: [
+      { id: 'cloud', backend: 'api', model: 'whisper-1' },
+      { id: 'keyless', backend: 'configured-model', provider: 'mistral', model: 'voxtral-mini-latest' },
+      { id: 'local', backend: 'api', baseUrl: 'http://127.0.0.1:8080/v1' },
+      { id: 'command', backend: 'exec', command: 'whisper-cli' },
+      { id: 'off', backend: 'api', model: 'whisper-1', enabled: false },
+    ],
+  }).providers;
+
+  await gate.load(assignApiKeyRefs(providers, {}).providers, {});
+  // A disabled record is left out even though its key is there.
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command', 'local']);
+  assert.equal(gate.isRegistered('keyless'), false);
+  assert.equal(await gate.isConfigured('keyless'), false);
+});
+
+test('flipping the switch registers and withdraws without a restart', async () => {
+  const speechToText = liveRegistry();
+  const writes = [];
+  const store = storeOf({ STT_KEY_CLOUD: 'sk-key' });
+  const gate = createProviderGate({ speechToText }, {
+    credentials: () => store,
+    persist: async (map) => { writes.push({ ...map }); return true; },
+  });
+  await gate.load(assignApiKeyRefs(normalizeConfig({
+    providers: [
+      { id: 'cloud', backend: 'api', model: 'whisper-1' },
+      { id: 'command', backend: 'exec', command: 'whisper-cli' },
+    ],
+  }).providers, {}).providers, {});
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command']);
+
+  // Off: the Host stops being offered the recognizer, here and now.
+  assert.deepEqual(await gate.setEnabled('cloud', false),
+    { enabled: false, outcome: 'unregistered', registered: false, saved: true });
+  assert.deepEqual([...speechToText.registered], ['command']);
+  assert.deepEqual(writes, [{ cloud: false }]);
+
+  // On again: the registration comes back, and the profile keeps the answer.
+  assert.deepEqual(await gate.setEnabled('cloud', true),
+    { enabled: true, outcome: 'registered', registered: true, saved: true });
+  assert.deepEqual([...speechToText.registered].sort(), ['cloud', 'command']);
+  assert.deepEqual(writes.at(-1), { cloud: true });
+
+  // An unknown id and a non-boolean are refused, not guessed.
+  assert.equal(await gate.setEnabled('nope', false), null);
+  assert.equal(await gate.setEnabled('cloud', 'yes'), null);
+});
+
+test('a switch that cannot reach the profile still works, and says so', async () => {
+  const speechToText = liveRegistry();
+  const warnings = [];
+  const gate = createProviderGate({ speechToText }, {
+    warn: (line) => warnings.push(line),
+    credentials: () => storeOf({ STT_KEY_CLOUD: 'sk-key' }),
+    persist: async () => false,
+  });
+  await gate.load(assignApiKeyRefs(normalizeConfig({
+    providers: [{ id: 'cloud', backend: 'api', model: 'whisper-1' }],
+  }).providers, {}).providers, {});
+
+  const outcome = await gate.setEnabled('cloud', false);
+  assert.equal(outcome.registered, false);
+  assert.equal(outcome.saved, false);
+  // The live effect still happened, and the operator is told it will not survive
+  // a restart instead of being told it worked.
+  assert.deepEqual([...speechToText.registered], []);
+  assert.match(warnings.join('\n'), /не легло в профиль/u);
+});
+
+test('a key saved later brings a record into the roster', async () => {
+  const speechToText = liveRegistry();
+  const values = {};
+  const gate = createProviderGate({ speechToText }, {
+    credentials: () => storeOf(values),
+    persist: async () => true,
+  });
+  await gate.load(assignApiKeyRefs(normalizeConfig({
+    providers: [{ id: 'cloud', backend: 'api', model: 'whisper-1' }],
+  }).providers, {}).providers, {});
+  assert.deepEqual([...speechToText.registered], []);
+
+  await gate.refreshAll();
+  assert.deepEqual([...speechToText.registered], []);
+
+  values.STT_KEY_CLOUD = 'sk-fresh';
+  await gate.refreshAll();
+  assert.deepEqual([...speechToText.registered], ['cloud']);
+});
+
+test('disposing the gate withdraws every registration it made', async () => {
+  const speechToText = liveRegistry();
+  const gate = createProviderGate({ speechToText }, { credentials: () => storeOf({}), persist: async () => true });
+  await gate.load(normalizeConfig({
+    providers: [
+      { id: 'command', backend: 'exec', command: 'whisper-cli' },
+      { id: 'local', backend: 'api', baseUrl: 'http://localhost:8080/v1' },
+    ],
+  }).providers, {});
+  assert.deepEqual([...speechToText.registered].sort(), ['command', 'local']);
+
+  await gate.dispose();
+  assert.deepEqual([...speechToText.registered], []);
 });

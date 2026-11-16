@@ -20,6 +20,7 @@ export const BASE_PATH = '/api/speech-gate'
 export const ROUTES = Object.freeze([
   { path: `${BASE_PATH}/state`, methods: ['GET'] },
   { path: `${BASE_PATH}/credential`, methods: ['POST'] },
+  { path: `${BASE_PATH}/enabled`, methods: ['POST'] },
 ])
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
@@ -86,28 +87,34 @@ export async function refPresent(ref, credentials) {
 }
 
 /**
- * One row of the card's state: which recognizer it is and where its key lives.
+ * One row of the card's state: which recognizer it is, where its key lives and
+ * whether it is any use right now.
  *
- * Every record that talks to a speech API has a name of its own, and a
- * `configured-model` record has the model connector behind it as well. The row
- * says which of the two holds the value (`keySource`), because the person's next
- * step differs: pasting a key here, or changing it in the model settings. A record
- * that takes no key — a local command — produces no row.
+ * Every recognizer this package drives is a row — a local one too, because "no key
+ * needed" is a fact the card has to say out loud instead of leaving a person
+ * wondering where the key field went. A remote record has a name of its own, and a
+ * `configured-model` record has the model connector behind it as well; the row says
+ * which of the two holds the value (`keySource`), because the person's next step
+ * differs: pasting a key here, or changing it in the model settings.
  * @param provider - one entry of `normalizeConfig(...).providers`.
  * @param credentials - the credentials service, or null.
- * @returns the state row, or null when this record takes no key.
+ * @param options - `configured` (a function that answers whether the record really
+ *   works, so a key from the environment or a file counts too).
+ * @returns the state row, or null for a record this card cannot draw.
  */
-export async function stateRow(provider, credentials) {
-  if (provider?.backend !== 'api') return null;
+export async function stateRow(provider, credentials, options = {}) {
+  if (provider === null || typeof provider !== 'object') return null;
+  const local = provider.local === true;
+  if (!local && provider.backend !== 'api') return null;
   const own = typeof provider.apiKeyRef === 'string' && provider.apiKeyRef !== '' ? provider.apiKeyRef : null;
   const connector = typeof provider.connectorApiKeyRef === 'string' && provider.connectorApiKeyRef !== ''
     ? provider.connectorApiKeyRef
     : null;
-  if (own === null && connector === null) return null;
   // Own first: a value typed into this card is the one the recognizer uses, so it
   // is also the one that decides what the row says.
   const ownPresent = await refPresent(own, credentials);
   const connectorPresent = ownPresent ? false : await refPresent(connector, credentials);
+  const keyPresent = ownPresent || connectorPresent;
   return {
     id: String(provider.id),
     name: typeof provider.displayName === 'string' && provider.displayName.trim() !== ''
@@ -116,26 +123,35 @@ export async function stateRow(provider, credentials) {
     // The upstream service (`yandex`, `openai`, ...): the card points at the right
     // console from this, not from a guess about the id.
     provider: typeof provider.provider === 'string' ? provider.provider : null,
-    // The name this record's own value belongs to — always set once the profile
-    // has been read, since a name is generated for every API record.
+    // Runs on this machine: no key, no key field, only a line saying so.
+    local,
+    // The card's own switch, as the profile has it.
+    enabled: provider.enabled !== false,
+    // Is this recognizer any use right now? The gate registers exactly these.
+    configured: typeof options.configured === 'function'
+      ? (await options.configured(provider)) === true
+      : local || keyPresent,
+    // The name this record's own value belongs to — null for a local one, which
+    // never gets a name at all.
     apiKeyRef: own,
     // The connector's credential, when this record may fall back to it.
     connectorRef: connector,
-    keyPresent: ownPresent || connectorPresent,
+    keyPresent,
     keySource: ownPresent ? 'own' : connectorPresent ? 'connector' : null,
   };
 }
 
 /**
- * The state the card draws: one row per recognizer that takes a key.
+ * The state the card draws: one row per recognizer, in configuration order.
  * @param providers - `normalizeConfig(...).providers`.
  * @param credentials - the credentials service, or null.
+ * @param options - see `stateRow`.
  * @returns `{ providers: [...] }`, in configuration order.
  */
-export async function stateOf(providers, credentials) {
+export async function stateOf(providers, credentials, options = {}) {
   const rows = [];
   for (const provider of Array.isArray(providers) ? providers : []) {
-    const row = await stateRow(provider, credentials);
+    const row = await stateRow(provider, credentials, options);
     if (row !== null) rows.push(row);
   }
   return { providers: rows };
@@ -169,6 +185,26 @@ export function credentialFrom(body) {
   return { ref, value: typeof body.value === 'string' ? body.value.trim() : '' };
 }
 
+/**
+ * Turn an untrusted body into the switch the card flipped.
+ *
+ * Only the id and the boolean travel: the record itself stays where it lives, in
+ * the profile and in the gate's own memory.
+ * @param body - parsed request body.
+ * @returns the id and the new state.
+ */
+export function enabledFrom(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw badRequest('тело запроса должно быть JSON-объектом');
+  }
+  const id = typeof body.id === 'string' ? body.id.trim() : '';
+  if (id === '') throw badRequest(`id должен быть непустой строкой, получено ${JSON.stringify(body.id)}`);
+  if (typeof body.enabled !== 'boolean') {
+    throw badRequest(`enabled должен быть true или false, получено ${JSON.stringify(body.enabled)}`);
+  }
+  return { id, enabled: body.enabled };
+}
+
 /** The HTTP status for a thrown error. */
 export function statusOf(error) {
   if (Number.isInteger(error?.status)) return error.status;
@@ -200,7 +236,8 @@ async function bodyOf(request) {
  *   lazily), already carrying the `apiKeyRef` each of them works with.
  * @param options - `warn` receives request failures, `log` the fact of a saved
  *   key (never the key), `credentials` returns the credentials service — a
- *   function when the service may mount later, as it does on a live Host.
+ *   function when the service may mount later, as it does on a live Host — and
+ *   `gate` keeps the Host's roster in step with the card's switch.
  * @returns a fetch-shaped function.
  */
 export function createHandler(providers, options = {}) {
@@ -209,7 +246,21 @@ export function createHandler(providers, options = {}) {
   // The credentials service may mount after this handler is built, so a getter is
   // read at use time: the same seam the provider resolves its key through.
   const credentialsOf = () => (typeof options.credentials === 'function' ? options.credentials() : options.credentials ?? null);
-  const listOf = async () => (typeof providers === 'function' ? await providers() : providers);
+  // The gate holds the live state of a record — the switch may have moved since
+  // the config was read — so a row is drawn from the gate when there is one.
+  const gateOf = () => options.gate ?? null;
+  const listOf = async () => {
+    const list = typeof providers === 'function' ? await providers() : providers;
+    const gate = gateOf();
+    if (typeof gate?.record !== 'function') return list;
+    return (Array.isArray(list) ? list : []).map((provider) => gate.record(provider?.id) ?? provider);
+  };
+  // Whether a record is really configured is the gate's answer when there is one,
+  // because a key may come from the environment or a file and not only from the
+  // store; without a gate `stateRow` falls back to the store alone.
+  const configuredOf = (gate) => (typeof gate?.isConfigured === 'function'
+    ? (provider) => gate.isConfigured(provider?.id)
+    : undefined);
 
   return async function handle(request) {
     let pathname = '';
@@ -219,7 +270,8 @@ export function createHandler(providers, options = {}) {
       pathname = url.pathname;
       method = String(request.method ?? 'GET').toUpperCase();
       if (pathname === `${BASE_PATH}/state` && method === 'GET') {
-        return json(200, await stateOf(await listOf(), credentialsOf()));
+        const gate = gateOf();
+        return json(200, await stateOf(await listOf(), credentialsOf(), { configured: configuredOf(gate) }));
       }
       if (pathname === `${BASE_PATH}/credential` && method === 'POST') {
         const { ref, value } = credentialFrom(await bodyOf(request));
@@ -248,7 +300,25 @@ export function createHandler(providers, options = {}) {
         }
         // The reference and the fact, never the value: this line is a log.
         log(`credential ${ref}: сохранён`);
+        // A key is what makes a remote recognizer usable, so the roster is brought
+        // in line right away: else the person would have to restart the Host for
+        // the recognizer to appear in the picker.
+        await gateOf()?.refreshAll?.();
         return json(200, { ok: true, ref, present: await refPresent(ref, credentials) });
+      }
+      if (pathname === `${BASE_PATH}/enabled` && method === 'POST') {
+        const { id, enabled } = enabledFrom(await bodyOf(request));
+        const gate = gateOf();
+        if (typeof gate?.setEnabled !== 'function') {
+          throw refusal(503, 'gate_unavailable', 'служба распознавания недоступна: переключатель некуда применить');
+        }
+        const outcome = await gate.setEnabled(id, enabled);
+        if (outcome === null) {
+          throw refusal(404, 'unknown_provider', `нет такого распознавателя: ${id}`);
+        }
+        // The fact, never the value: this line is a log for the operator.
+        log(`распознаватель ${id}: ${enabled ? 'включён' : 'выключен'}, регистрация ${outcome.outcome}`);
+        return json(200, { ok: true, id, enabled: outcome.enabled, registered: outcome.registered, saved: outcome.saved });
       }
       return json(404, { code: 'not-found', error: `нет такого маршрута: ${method} ${pathname}` });
     } catch (error) {
@@ -298,6 +368,9 @@ export function mountRoutes(ctx, providers, options = {}) {
     // Read at use time: the credentials service mounts after this handler does,
     // and it is the very service the keyed provider resolves its key through.
     credentials: options.credentials ?? (() => readService(ctx, 'credentials')),
+    // The switch and the roster live in one object: flipping it withdraws the
+    // registration right away instead of waiting for a restart.
+    gate: options.gate,
   });
 
   const install = (connection) => {

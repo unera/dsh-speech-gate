@@ -42,6 +42,12 @@ export const inject = ['speechToText'];
 export const Config = Schema.object({
   apiKeyRefs: Schema.dict(Schema.string()).default({}).volatile()
     .description('Сгенерированные имена ключей: id записи → имя в хранилище учётных данных'),
+  // The card's «включён» switch. The record itself carries `enabled` as its
+  // declared default, but the settings service writes only volatile fields, and a
+  // record lives inside the non-volatile `providers` array — so the switch keeps
+  // its answer here, next to the names, and this map wins over the record.
+  enabledById: Schema.dict(Schema.boolean()).default({}).volatile()
+    .description('Переключатели «включён», записанные карточкой: id записи → true/false'),
 });
 
 const DEFAULT_LANGUAGES = Object.freeze(['ru', 'en']);
@@ -123,6 +129,26 @@ export function apiKeyRefFor(id) {
   const name = String(id ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '_');
   if (name === '') return '';
   return `${STT_KEY_PREFIX}${name}`.slice(0, CREDENTIAL_REF_MAX);
+}
+
+/**
+ * Whether an endpoint names this machine.
+ *
+ * A recognizer on `127.0.0.1` or `localhost` is a whisper.cpp / faster-whisper
+ * server next door: it wants no key, so such a record gets no credential name, no
+ * key field and no "no key yet" state — only a line saying the key is not needed.
+ * @param value - an endpoint URL, or a bare host.
+ * @returns true for a loopback host.
+ */
+export function isLocalEndpoint(value) {
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  let host = '';
+  try {
+    host = new URL(value.includes('://') ? value : `http://${value}`).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
 }
 
 // Model families that only one provider serves, so a config can skip `provider`.
@@ -228,6 +254,9 @@ function normalizeProvider(input = {}) {
   const providerName = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : null;
   const base = {
     backend,
+    // A disabled record is not registered at all: it is not a choice the Host may
+    // offer, and its absence is visible in the card instead of a failure at use.
+    enabled: config.enabled !== false,
     id: requireString(
       config.id ?? (providerName === 'yandex' ? 'yandex' : backend === 'api' ? 'openai-compatible' : 'local-command'),
       'id',
@@ -250,6 +279,8 @@ function normalizeProvider(input = {}) {
       endpoint: YANDEX_STT_ENDPOINT,
       baseUrl: null,
       model: null,
+      // A cloud service, whatever else the record says: a key is always needed.
+      local: false,
       // The name comes from the config, or is generated later from this record's
       // own id: every record owns its secret name, and the synthesizer's
       // SpeechKit key is a different record, not a default.
@@ -270,6 +301,8 @@ function normalizeProvider(input = {}) {
     return Object.freeze({
       ...base,
       configured: true,
+      // A model connector is a cloud service: the key always comes from somewhere.
+      local: false,
       provider: family,
       baseUrl: config.baseUrl
         ? requireString(config.baseUrl, 'baseUrl').replace(/\/+$/, '')
@@ -288,17 +321,28 @@ function normalizeProvider(input = {}) {
     });
   }
   if (backend === 'api') {
+    const baseUrl = requireString(config.baseUrl ?? 'https://api.openai.com/v1', 'baseUrl').replace(/\/+$/, '');
+    const spelled = explicitApiKeyRef(config);
+    // A whisper server on this machine takes no key: such a record is local, so it
+    // gets no credential name and the card offers no key field. A record that
+    // spells a name out is left alone — the config said it wants a key, and the
+    // person may be fronting a loopback server with a token.
+    const local = spelled === null && (config.location === 'host-local' || isLocalEndpoint(baseUrl));
     return Object.freeze({
       ...base,
-      baseUrl: requireString(config.baseUrl ?? 'https://api.openai.com/v1', 'baseUrl').replace(/\/+$/, ''),
+      // Where the recognizer runs is a fact about the endpoint, not about the
+      // backend: a loopback API record is host-local even if the config forgot it.
+      location: local ? 'host-local' : base.location,
+      local,
+      baseUrl,
       model: requireString(config.model ?? 'whisper-1', 'model'),
       // An endpoint this record owns: its key name is generated from the id when
       // the config says nothing. A missing value is not an error — a whisper
-      // server next door usually wants no key at all — so it stays optional
-      // unless the config named one itself.
-      apiKeyRef: explicitApiKeyRef(config),
+      // server next door wants no key at all — so it stays optional unless the
+      // config named one itself.
+      apiKeyRef: spelled,
       connectorApiKeyRef: null,
-      keyRequired: explicitApiKeyRef(config) !== null,
+      keyRequired: spelled !== null,
       apiKeyEnv: typeof config.apiKeyEnv === 'string' && config.apiKeyEnv.trim() ? config.apiKeyEnv.trim() : null,
       apiKeyFile: typeof config.apiKeyFile === 'string' && config.apiKeyFile.trim() ? config.apiKeyFile.trim() : null,
       extraFields: config.extraFields && typeof config.extraFields === 'object' ? { ...config.extraFields } : {},
@@ -308,6 +352,8 @@ function normalizeProvider(input = {}) {
   const args = Array.isArray(config.args) ? config.args.map((entry) => requireString(entry, 'args')) : [];
   return Object.freeze({
     ...base,
+    // A command runs on this machine and takes no key at all.
+    local: true,
     command,
     args: Object.freeze(args),
     stripTimestamps: config.stripTimestamps !== false,
@@ -347,7 +393,9 @@ function uniqueRef(base, taken) {
  * has the connector's credential as a fallback: two places a person controls
  * separately, at the price of a duplicated secret on purpose.
  *
- * A local command takes no key and comes back untouched.
+ * A local recognizer — the `exec` backend, or an API record whose endpoint is
+ * this machine — takes no key and comes back untouched: it is not a name to
+ * generate, and the card draws a line saying so instead of a key field.
  *
  * An explicit `apiKeyRef` is never replaced, whatever the record is: there may be
  * a working secret under it already.
@@ -361,7 +409,7 @@ export function assignApiKeyRefs(providers, stored = {}) {
   const taken = new Set(list.map((provider) => provider?.apiKeyRef).filter((ref) => typeof ref === 'string' && ref !== ''));
   const added = {};
   const next = list.map((provider) => {
-    if (provider?.backend !== 'api' || provider?.apiKeyRef !== null) return provider;
+    if (provider?.backend !== 'api' || provider?.apiKeyRef !== null || provider?.local === true) return provider;
     const remembered = typeof known[provider.id] === 'string' && CREDENTIAL_REF_PATTERN.test(known[provider.id])
       ? known[provider.id]
       : null;
@@ -374,21 +422,232 @@ export function assignApiKeyRefs(providers, stored = {}) {
 }
 
 /**
- * Write the generated names into this plugin's own profile entry.
+ * Write one volatile map into this plugin's own profile entry.
  *
  * The settings service is the only writer of a profile row, and it accepts the
- * write only for a field its Config marks volatile — `apiKeyRefs` is that field.
+ * write only for a field its Config marks volatile — `apiKeyRefs` and
+ * `enabledById` are those fields.
+ * @param ctx - plugin context.
+ * @param patch - the volatile fields to merge.
+ * @returns whether the patch reached the profile.
+ */
+async function persistVolatile(ctx, patch) {
+  const settings = readService(ctx, 'settings');
+  if (typeof settings?.update !== 'function') return false;
+  const entryId = ctx?.fiber?.entry?.options?.id;
+  if (typeof entryId !== 'string' || entryId === '') return false;
+  await settings.update(entryId, patch);
+  return true;
+}
+
+/**
+ * Write the generated names into this plugin's own profile entry.
  * @param ctx - plugin context.
  * @param refs - the whole id → name map to keep.
  * @returns whether the map reached the profile.
  */
 export async function persistApiKeyRefs(ctx, refs) {
-  const settings = readService(ctx, 'settings');
-  if (typeof settings?.update !== 'function') return false;
-  const entryId = ctx?.fiber?.entry?.options?.id;
-  if (typeof entryId !== 'string' || entryId === '') return false;
-  await settings.update(entryId, { apiKeyRefs: { ...refs } });
-  return true;
+  return persistVolatile(ctx, { apiKeyRefs: { ...refs } });
+}
+
+/**
+ * Write the card's «включён» answers into this plugin's own profile entry.
+ * @param ctx - plugin context.
+ * @param enabledById - the whole id → boolean map to keep.
+ * @returns whether the map reached the profile.
+ */
+export async function persistEnabled(ctx, enabledById) {
+  return persistVolatile(ctx, { enabledById: { ...enabledById } });
+}
+
+/**
+ * The records with the card's own switch applied.
+ *
+ * The record's `enabled` is the default the config declares; a value the card
+ * wrote into `enabledById` wins over it, because the person clicked later than the
+ * file was written.
+ * @param providers - `normalizeConfig(...).providers`, or the same after names.
+ * @param stored - the `enabledById` map from the profile entry.
+ * @returns the records with `enabled` resolved, the same objects when nothing changed.
+ */
+export function applyEnabled(providers, stored = {}) {
+  const known = stored !== null && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+  const list = Array.isArray(providers) ? providers : [];
+  return Object.freeze(list.map((provider) => {
+    if (provider === null || typeof provider !== 'object') return provider;
+    const written = known[provider.id];
+    const enabled = typeof written === 'boolean' ? written : provider.enabled !== false;
+    return enabled === provider.enabled ? provider : Object.freeze({ ...provider, enabled });
+  }));
+}
+
+/**
+ * Whether a record can actually transcribe.
+ *
+ * A local recognizer always can — it needs no key. A remote one can only when a
+ * key is there: its own, the model connector's, an environment variable or a
+ * file. This is the rule the Host's picker follows: a recognizer nobody configured
+ * is not offered at all, so a person cannot choose something that cannot work.
+ * @param provider - one normalized provider.
+ * @param ctx - plugin context, for `credentials`.
+ * @param deps - `credentials` to bring a store instead of reading it.
+ * @returns true when the record has everything it needs.
+ */
+export async function isConfigured(provider, ctx, { credentials } = {}) {
+  if (provider === null || typeof provider !== 'object') return false;
+  if (provider.local === true) return true;
+  if (provider.backend !== 'api') return false;
+  // A record whose name has not been generated yet is asked about the name it
+  // would get, so the answer does not depend on when in the lifecycle it is asked.
+  const own = typeof provider.apiKeyRef === 'string' && provider.apiKeyRef !== ''
+    ? provider.apiKeyRef
+    : apiKeyRefFor(provider.id);
+  return (await resolveApiKey({ ...provider, apiKeyRef: own }, ctx, { hasCredentials: credentials })) !== '';
+}
+
+/**
+ * The live registration of the recognizers the Host may offer.
+ *
+ * A provider is registered only when it is both enabled and configured, and the
+ * two answers can change while the Host runs: the card's switch flips `enabled`,
+ * a saved key makes a record configured. Withdrawing one is the disposer
+ * `speechToText.register()` returned — no restart, no remount.
+ * @param ctx - plugin context.
+ * @param options - `warn`, `credentials` (a store or a getter, read at use time),
+ *   `persist` (writes the switch into the profile, returns whether it landed).
+ * @returns the gate.
+ */
+export function createProviderGate(ctx, options = {}) {
+  const warn = typeof options.warn === 'function' ? options.warn : () => {};
+  const credentialsOf = typeof options.credentials === 'function'
+    ? options.credentials
+    : () => options.credentials ?? readService(ctx, 'credentials');
+  const persist = typeof options.persist === 'function' ? options.persist : async () => false;
+  /** id → the record as the card's switch leaves it. */
+  const records = new Map();
+  /** id → the disposer `register()` answered with. */
+  const active = new Map();
+  let overrides = {};
+  let disposed = false;
+
+  const registry = () => {
+    try {
+      return ctx?.speechToText ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const configured = (provider) => isConfigured(provider, ctx, { credentials: credentialsOf() });
+
+  async function withdraw(id) {
+    const entry = active.get(id);
+    if (entry === undefined) return false;
+    active.delete(id);
+    try {
+      await entry.dispose();
+    } catch (error) {
+      warn(`распознаватель ${id} не снят: ${error?.message ?? error}`);
+    }
+    return true;
+  }
+
+  async function admit(provider) {
+    const service = registry();
+    if (service === null || typeof service.register !== 'function') return false;
+    active.set(provider.id, { dispose: service.register(createProvider(provider, ctx)) });
+    return true;
+  }
+
+  /** Bring one record in line with its own answers. */
+  async function settle(provider) {
+    const was = active.has(provider.id);
+    const wanted = !disposed && provider.enabled !== false && await configured(provider);
+    if (wanted && !was) {
+      await admit(provider);
+      return 'registered';
+    }
+    if (!wanted && was) {
+      await withdraw(provider.id);
+      return 'unregistered';
+    }
+    return 'unchanged';
+  }
+
+  const usable = (id) => {
+    const provider = records.get(id);
+    return provider === undefined ? null : provider;
+  };
+
+  return {
+    /**
+     * Take the configured records and settle every one of them.
+     * @param providers - normalized providers, names already assigned.
+     * @param storedEnabled - the `enabledById` map from the profile entry.
+     * @returns the list with `enabled` resolved.
+     */
+    async load(providers, storedEnabled = {}) {
+      overrides = storedEnabled !== null && typeof storedEnabled === 'object' && !Array.isArray(storedEnabled)
+        ? { ...storedEnabled }
+        : {};
+      const list = applyEnabled(providers, overrides);
+      for (const provider of list) records.set(provider.id, provider);
+      for (const provider of list) await settle(provider);
+      return list;
+    },
+    /**
+     * Re-settle one record — after a key was saved under its name, say.
+     * @param id - the record id.
+     * @returns the outcome, or null for an unknown id.
+     */
+    async refresh(id) {
+      const provider = usable(id);
+      return provider === null ? null : settle(provider);
+    },
+    /** Re-settle every record: a key was written and any of them may now work. */
+    async refreshAll() {
+      for (const provider of records.values()) await settle(provider);
+    },
+    /**
+     * Flip the card's switch: the live registration follows immediately, and the
+     * answer is written into the profile so it survives a restart.
+     * @param id - the record id.
+     * @param enabled - the new state.
+     * @returns `{ enabled, outcome, registered, saved }`, or null for an unknown id.
+     */
+    async setEnabled(id, enabled) {
+      const provider = usable(id);
+      if (provider === null || typeof enabled !== 'boolean') return null;
+      const next = Object.freeze({ ...provider, enabled });
+      records.set(id, next);
+      overrides = { ...overrides, [id]: enabled };
+      const outcome = await settle(next);
+      let saved = false;
+      try {
+        saved = (await persist({ ...overrides })) === true;
+      } catch (error) {
+        warn(`переключатель ${id} не записан в профиль: ${error?.message ?? error}`);
+      }
+      if (!saved) {
+        warn(`переключатель ${id}: значение не легло в профиль — до перезапуска оно живёт только в памяти`);
+      }
+      return { enabled, outcome, registered: active.has(id), saved };
+    },
+    /** Whether this record has a live registration right now. */
+    isRegistered: (id) => active.has(id),
+    /** Whether this record has everything it needs, switch aside. */
+    async isConfigured(id) {
+      const provider = usable(id);
+      return provider === null ? false : configured(provider);
+    },
+    /** The record as the gate holds it, switch included. */
+    record: usable,
+    /** Withdraw every registration this gate made. */
+    async dispose() {
+      disposed = true;
+      for (const id of [...active.keys()]) await withdraw(id);
+    },
+  };
 }
 
 /**
@@ -655,15 +914,20 @@ export function createProvider(options, ctx) {
 }
 
 /**
- * Register every configured recognizer for the lifetime of this plugin.
+ * Register every configured, enabled recognizer for the lifetime of this plugin.
  *
- * The card in the web settings talks to the routes mounted here; without them it
- * has nothing to read and nowhere to put a key.
+ * "Configured" is the whole point of the rule: a recognizer with no key at all is
+ * not registered, so the Host's picker cannot offer something that would fail on
+ * the first attempt. The card in the web settings talks to the routes mounted
+ * here; without them it has nothing to read and nowhere to put a key or a switch.
  */
 export function apply(ctx, config = {}) {
   const { providers } = normalizeConfig(config);
   const stored = config?.apiKeyRefs !== null && typeof config?.apiKeyRefs === 'object' && !Array.isArray(config.apiKeyRefs)
     ? config.apiKeyRefs
+    : {};
+  const storedEnabled = config?.enabledById !== null && typeof config?.enabledById === 'object' && !Array.isArray(config.enabledById)
+    ? config.enabledById
     : {};
   // The names travel with the records: the card, the store and `resolveApiKey()`
   // all ask the same object what a secret is called.
@@ -681,11 +945,23 @@ export function apply(ctx, config = {}) {
       })
       .catch((error) => warn(`имена ключей не записаны в профиль: ${error?.message ?? error}`));
   }
-  ctx.effect(() => {
-    const unregister = keyed.map((options) => ctx.speechToText.register(createProvider(options, ctx)));
-    return () => { for (const dispose of unregister) void dispose(); };
+  const gate = createProviderGate(ctx, {
+    warn,
+    // Read at use time: the credentials service mounts after this plugin does.
+    credentials: () => readService(ctx, 'credentials'),
+    persist: (map) => persistEnabled(ctx, map),
   });
-  mountRoutes(ctx, keyed, { warn, log: (message) => (typeof ctx?.logger?.info === 'function' ? ctx.logger.info(message) : console.info(`[dsh-speech-gate] ${message}`)) });
+  ctx.effect(() => {
+    // Whether a record is configured is the store's answer, so the roster settles
+    // asynchronously — but the effect itself is synchronous, as the Host expects.
+    void gate.load(keyed, storedEnabled).catch((error) => warn(`распознаватели не зарегистрированы: ${error?.message ?? error}`));
+    return () => { void gate.dispose(); };
+  });
+  mountRoutes(ctx, keyed, {
+    warn,
+    log: (message) => (typeof ctx?.logger?.info === 'function' ? ctx.logger.info(message) : console.info(`[dsh-speech-gate] ${message}`)),
+    gate,
+  });
 }
 
 export default Object.freeze({ name, inject, Config, apply });
