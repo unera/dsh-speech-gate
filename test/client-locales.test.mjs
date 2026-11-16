@@ -48,10 +48,15 @@ test('the placeholders the card fills in exist in every language', () => {
 });
 
 test('the two notes that explain the key are present and say the right thing', () => {
-  // The shared SpeechKit key: one account for both directions.
-  assert.match(DICTIONARIES.ru['card.note'], /SpeechKit/u);
-  assert.match(DICTIONARIES.ru['card.note'], /синтез/u);
-  assert.match(DICTIONARIES.ru['card.note'], /распознаван/u);
+  // One Yandex key serves every SpeechKit service — and this card stores its own,
+  // separately from the synthesizer. The old sentence ("the key is one and the same
+  // for synthesis and recognition") was read as "the two are connected", so the new
+  // one names the account, not a link between the two plugins.
+  assert.match(DICTIONARIES.ru['card.note'], /один ключ на все сервисы SpeechKit/u);
+  assert.match(DICTIONARIES.ru['card.note'], /отдельно от синтеза/u);
+  assert.match(DICTIONARIES.ru['card.note'], /тот же или другой/u);
+  assert.doesNotMatch(DICTIONARIES.ru['card.note'], /один и тот же для синтеза и распознавания/u);
+  assert.doesNotMatch(DICTIONARIES.ru['card.note'], /локальным распознавателям ключ не нужен/u);
   // The connector note says the field may stay empty and where the key then comes from.
   assert.match(DICTIONARIES.ru['card.connectorHint'], /можно не заполнять/u);
   assert.match(DICTIONARIES.ru['card.connectorHint'], /настроек модели/u);
@@ -60,4 +65,33 @@ test('the two notes that explain the key are present and say the right thing', (
   // The console the hint points at is named, not just linked.
   assert.match(DICTIONARIES.ru['card.keyWhereLink'], /Yandex/u);
   assert.match(DICTIONARIES.ru['card.keyWhereAfter'], /API/u);
+});
+
+test('the header says where the recognizer itself is chosen — in all three languages', () => {
+  // The card configures candidates; the choice is made on another page. Without
+  // this line a person edits the wrong screen and calls the recognizer broken.
+  assert.match(DICTIONARIES.ru['card.sourceHint'], /Плагины/u);
+  assert.match(DICTIONARIES.ru['card.sourceHint'], /Голосовой ввод/u);
+  assert.match(DICTIONARIES.ru['card.sourceHint'], /Сервис распознавания/u);
+
+  assert.match(DICTIONARIES.en['card.sourceHint'], /Plugins/u);
+  assert.match(DICTIONARIES.en['card.sourceHint'], /Voice input/u);
+  assert.match(DICTIONARIES.en['card.sourceHint'], /Recognition service/u);
+
+  assert.match(DICTIONARIES.zh['card.sourceHint'], /插件/u);
+  assert.match(DICTIONARIES.zh['card.sourceHint'], /语音输入/u);
+  assert.match(DICTIONARIES.zh['card.sourceHint'], /识别服务/u);
+});
+
+test('the local and unconfigured lines exist in every language', () => {
+  for (const language of languages) {
+    // A local recognizer says the key is not needed, in those words.
+    assert.match(DICTIONARIES[language]['card.localNoKey'], /локальный|local|本地/iu);
+    // A record nobody configured says it takes no part, not just "no key yet".
+    assert.match(DICTIONARIES[language]['card.noKeyUnused'], /не используется|not used|未被使用/iu);
+    // The switch's own label and the two answers it can give.
+    assert.notEqual(DICTIONARIES[language]['card.enabled'].trim(), '');
+    assert.notEqual(DICTIONARIES[language]['card.enabledOn'].trim(), '');
+    assert.notEqual(DICTIONARIES[language]['card.enabledOff'].trim(), '');
+  }
 });

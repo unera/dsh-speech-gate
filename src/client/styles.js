@@ -21,10 +21,25 @@ export const CSS = `
   background: rgba(127,127,127,.12); border-radius: 4px; font-size: 11px;
   padding: 1px 5px; opacity: .75;
 }
-.dsg-key-state { font-size: 12px; font-weight: 600; }
+.dsg-key-state { font-size: 12px; font-weight: 600; margin-left: 4px; }
 .dsg-key-ok { color: #3fb950; font-size: 12px; font-weight: 600; }
 .dsg-key-off { color: #d29922; font-size: 12px; font-weight: 600; }
+/* A local recognizer needs no key: that is a fact, not a missing value. */
+.dsg-key-local { color: #8b949e; font-size: 12px; font-weight: 600; }
+/* The field's own heading. It is a block of its own and the state chip lives
+   elsewhere: laid out as one run of inline text the two read as «API-ключключ
+   сохранён», which is exactly what this rule and .dsg-key-state prevent. */
+.dsg-field-label { flex: 0 0 auto; font-size: 12px; font-weight: 600; margin-right: 2px; }
 .dsg-key-row { align-items: center; display: flex; flex-wrap: wrap; gap: 10px; min-width: 0; }
+/* A record nobody configured takes part in nothing: drawn greyed out, with the
+   sentence saying so under the field it is missing a value for. */
+.dsg-provider-off { opacity: .55; }
+.dsg-unconfigured { color: #d29922; opacity: .9; }
+.dsg-switch { align-items: center; display: inline-flex; gap: 6px; font-size: 12px; width: fit-content; }
+.dsg-switch-input { accent-color: #3fb950; cursor: pointer; height: 14px; margin: 0; width: 14px; }
+.dsg-switch-input:disabled { cursor: default; opacity: .55; }
+.dsg-switch-label { user-select: none; }
+.dsg-source { opacity: .75; }
 .dsg-input {
   background: transparent; border: 1px solid rgba(127,127,127,.35); border-radius: 6px;
   box-sizing: border-box; color: inherit; color-scheme: dark; font: inherit;

@@ -1,18 +1,23 @@
-// The speech gate card: one row per recognizer that takes a key.
+// The speech gate card: one row per recognizer, with its key and its switch.
 //
 // Two halves on purpose. `SpeechGateView` is a pure function of its props, so a
 // test renders it with fixture rows and no DOM; `SpeechGateCard` owns the only
 // state there is — the snapshot from the host, the values being typed and the
-// answer to the last save.
+// answer to the last save or flip.
 //
-// The card does not decide where a key is stored. Every row the host sends has a
-// credential name of its own, and this card may set the value under it; a row that
-// also has a model connector behind it (`connectorRef`) says so, because leaving the
-// field empty is then a legitimate choice — the connector's key answers instead.
-// Local commands take no key at all and never reach this file.
+// The card does not decide where a key is stored. Every remote row the host sends
+// has a credential name of its own, and this card may set the value under it; a row
+// that also has a model connector behind it (`connectorRef`) says so, because
+// leaving the field empty is then a legitimate choice — the connector's key
+// answers instead. A local recognizer (`local`) has no key at all, and the card
+// says that in words instead of drawing a field nobody should fill.
+//
+// The recognizer a person actually uses is chosen in the Host's voice-input
+// settings, not here, and the header line says where: this card configures the
+// candidates, the other page picks one.
 
 import { createElement as h, Component, useEffect, useState } from 'react'
-import { getState, saveCredential } from './api.js'
+import { getState, saveCredential, saveEnabled } from './api.js'
 
 /** Where a SpeechKit key is issued. Named once, linked from the hint. */
 export const KEY_CONSOLE_URL = 'https://aistudio.yandex.cloud/platform/'
@@ -43,12 +48,48 @@ export function providerRows (snapshot) {
       // `own` (a value under this record's name), `connector` (the model
       // settings answer instead) or nothing at all.
       keySource: row.keySource === 'own' || row.keySource === 'connector' ? row.keySource : null,
+      // Runs on this machine: no key, and the card says so instead of a field.
+      local: row.local === true,
+      // The switch, and whether the record has everything it needs. A record
+      // nobody configured is shown greyed out: it takes no part in recognition.
+      enabled: row.enabled !== false,
+      configured: row.configured === true,
     }))
 }
 
 /** Whether this row has a credential name to write under. */
 export function showsKeyField (row) {
   return typeof row?.apiKeyRef === 'string' && row.apiKeyRef !== ''
+}
+
+/**
+ * Whether this row runs on this machine and therefore needs no key at all.
+ * @param row - one entry of `providerRows()`.
+ * @returns true for a local recognizer.
+ */
+export function isLocalRow (row) {
+  return row?.local === true
+}
+
+/**
+ * Whether this row gets the «включён» switch.
+ *
+ * Only a record that can work right now has one: a switch on a recognizer with no
+ * key would suggest it could be turned on, and it could not.
+ * @param row - one entry of `providerRows()`.
+ * @returns true for a configured record.
+ */
+export function showsEnabledSwitch (row) {
+  return row?.configured === true
+}
+
+/**
+ * Whether this row is shown greyed out because nothing is configured for it.
+ * @param row - one entry of `providerRows()`.
+ * @returns true for a record that takes part in nothing.
+ */
+export function isUnconfiguredRow (row) {
+  return row?.configured !== true
 }
 
 /**
@@ -74,8 +115,16 @@ export function isYandexProvider (row) {
  * @returns the text of the chip.
  */
 export function keyStateText (t, row) {
+  // A local recognizer has no key question to answer: say the fact, not "no key".
+  if (isLocalRow(row)) return t('card.localNoKey')
   if (row?.keyPresent !== true) return t('card.keyMissing')
   return row.keySource === 'connector' ? t('card.keyPresentConnector') : t('card.keyPresent')
+}
+
+/** The `data-key-state` the chip carries, so a test and a stylesheet can find it. */
+export function keyStateOf (row) {
+  if (isLocalRow(row)) return 'local'
+  return row?.keyPresent === true ? 'present' : 'missing'
 }
 
 /**
@@ -107,7 +156,7 @@ function button (label, onClick, options = {}) {
 /**
  * The rows of the card, as a function of the snapshot and the drafts.
  * @param props - `t`, `loading`, `providers`, `busy`, `drafts`, `notices`, `error`
- *   and the handlers `onChange`, `onSave`.
+ *   and the handlers `onChange`, `onSave`, `onToggle`.
  * @returns the card element.
  */
 export function SpeechGateView (props) {
@@ -118,10 +167,18 @@ export function SpeechGateView (props) {
   const busy = typeof props?.busy === 'string' ? props.busy : null
   const onChange = typeof props?.onChange === 'function' ? props.onChange : () => {}
   const onSave = typeof props?.onSave === 'function' ? props.onSave : () => {}
+  const onToggle = typeof props?.onToggle === 'function' ? props.onToggle : () => {}
 
   const children = [h('h2', { className: 'dsg-title' }, t('card.title'))]
+  // This card configures candidates; which one transcribes is chosen elsewhere,
+  // and a person who does not know that edits the wrong screen and concludes the
+  // recognizer is broken.
+  children.push(h('p', {
+    className: 'dsg-note dsg-source',
+    'data-source-hint': 'true',
+  }, t('card.sourceHint')))
   // The one sentence that keeps a person from opening a second SpeechKit account:
-  // the synthesizer and the recognizer read the same key.
+  // one Yandex key serves every SpeechKit service, and this card keeps its own.
   children.push(h('p', { className: 'dsg-note' }, t('card.note')))
 
   if (props?.loading === true) {
@@ -132,18 +189,24 @@ export function SpeechGateView (props) {
     const rows = providers.map((row) => {
       const saving = busy === row.id
       const notice = notices[row.id] ?? null
+      const local = isLocalRow(row)
       const fields = [
         h('div', { className: 'dsg-provider-head', key: 'head' },
           h('span', { className: 'dsg-provider-name' }, row.name),
           h('code', { className: 'dsg-provider-id' }, row.id),
           h('span', {
-            className: row.keyPresent ? 'dsg-key-ok dsg-key-state' : 'dsg-key-off dsg-key-state',
-            'data-key-state': row.keyPresent ? 'present' : 'missing',
+            className: local
+              ? 'dsg-key-local dsg-key-state'
+              : row.keyPresent ? 'dsg-key-ok dsg-key-state' : 'dsg-key-off dsg-key-state',
+            'data-key-state': keyStateOf(row),
           }, keyStateText(t, row))),
       ]
       if (showsKeyField(row)) {
         fields.push(
+          // The label and the state are two separate elements on purpose: drawn as
+          // one run of text they read as «API-ключключ сохранён» on the live screen.
           h('div', { className: 'dsg-key-row', key: 'row' },
+            h('span', { className: 'dsg-field-label' }, t('card.key')),
             h('textarea', {
               className: 'dsg-input dsg-key-input',
               // One row and a fixed height: a key is one line, and a box that can
@@ -180,15 +243,39 @@ export function SpeechGateView (props) {
             t('card.keyWhereAfter')))
         }
       }
+      // Nothing configured: the record takes part in nothing, and the line says
+      // why instead of leaving a person to guess from a "no key yet".
+      if (isUnconfiguredRow(row)) {
+        fields.push(h('p', {
+          className: 'dsg-note dsg-unconfigured',
+          key: 'unused',
+          'data-unconfigured': 'true',
+        }, t('card.noKeyUnused')))
+      }
+      if (showsEnabledSwitch(row)) {
+        fields.push(h('label', { className: 'dsg-switch', key: 'enabled' },
+          h('input', {
+            type: 'checkbox',
+            className: 'dsg-switch-input',
+            checked: row.enabled !== false,
+            disabled: saving,
+            'aria-label': t('card.enabled'),
+            onChange: (event) => onToggle(row.id, event?.target?.checked === true),
+          }),
+          h('span', { className: 'dsg-switch-label' }, t('card.enabled'))))
+      }
       if (notice !== null) {
         fields.push(h('p', { className: notice.kind === 'error' ? 'dsg-error' : 'dsg-ok', key: 'notice' },
           notice.text ?? ''))
       }
       return h('li', {
         key: row.id,
-        className: 'dsg-provider',
+        className: isUnconfiguredRow(row) ? 'dsg-provider dsg-provider-off' : 'dsg-provider',
         'data-provider': row.id,
         'data-key-source': row.keySource ?? 'none',
+        'data-local': local ? 'true' : 'false',
+        'data-enabled': row.enabled === false ? 'false' : 'true',
+        'data-configured': isUnconfiguredRow(row) ? 'false' : 'true',
       }, ...fields)
     })
     children.push(h('ul', { className: 'dsg-list' }, ...rows))
@@ -246,6 +333,9 @@ export function SpeechGateCard (props) {
   const [notices, setNotices] = useState({})
 
   const apply = (snapshot) => setState({ loading: false, providers: providerRows(snapshot), error: null })
+  const say = (id, kind, text) => {
+    setNotices((previous) => ({ ...previous, [id]: { kind, text } }))
+  }
 
   useEffect(() => {
     let alive = true
@@ -281,6 +371,31 @@ export function SpeechGateCard (props) {
       .finally(() => setBusy(null))
   }
 
+  /**
+   * Flip the switch and let the host re-read the row.
+   *
+   * The registration changes in the running service at once, so the answer is what
+   * happened, not what was asked for; the row is then redrawn from a fresh
+   * `/state`, because whether a record is enabled and configured is the host's
+   * answer and never this card's guess.
+   * @param id - the record id.
+   * @param enabled - the state the person wants.
+   */
+  const onToggle = (id, enabled) => {
+    setBusy(id)
+    setNotices((previous) => ({ ...previous, [id]: null }))
+    saveEnabled(id, enabled)
+      .then((answer) => {
+        const registered = answer?.registered !== false
+        say(id, 'ok', enabled
+          ? (registered ? t('card.enabledOn') : t('card.enabledOff'))
+          : t('card.enabledOff'))
+        return getState().then(apply).catch(() => {})
+      })
+      .catch((error) => say(id, 'error', t('card.error').replace('{0}', messageOf(error))))
+      .finally(() => setBusy(null))
+  }
+
   return h(SpeechGateView, {
     t,
     loading: state.loading,
@@ -291,6 +406,7 @@ export function SpeechGateCard (props) {
     error: state.error,
     onChange: (id, value) => setDrafts((previous) => ({ ...previous, [id]: value })),
     onSave,
+    onToggle,
   })
 }
 

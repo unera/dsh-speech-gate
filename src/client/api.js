@@ -47,3 +47,16 @@ export const getState = () => request('/state')
  */
 export const saveCredential = (ref, value) =>
   request('/credential', { method: 'POST', body: JSON.stringify({ ref, value }) })
+
+/**
+ * Flip one recognizer's «включён» switch.
+ *
+ * The host answers with what actually happened — the record is registered or
+ * withdrawn in the running service at once, no restart involved — and with
+ * `saved`, which says whether the answer also reached the profile.
+ * @param id - the record id from the state.
+ * @param enabled - the new state of the switch.
+ * @returns `{ ok, id, enabled, registered, saved }`.
+ */
+export const saveEnabled = (id, enabled) =>
+  request('/enabled', { method: 'POST', body: JSON.stringify({ id, enabled }) })

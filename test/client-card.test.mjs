@@ -26,6 +26,9 @@ const YANDEX_WITH_KEY = {
   id: 'yandex-stt',
   name: 'Yandex SpeechKit (облако)',
   provider: 'yandex',
+  local: false,
+  enabled: true,
+  configured: true,
   apiKeyRef: 'YANDEX_SPEECHKIT_API_KEY',
   connectorRef: null,
   keyPresent: true,
@@ -35,6 +38,9 @@ const YANDEX_WITHOUT_KEY = {
   id: 'yandex-new',
   name: 'Yandex SpeechKit, второй',
   provider: 'yandex',
+  local: false,
+  enabled: true,
+  configured: false,
   apiKeyRef: 'STT_KEY_YANDEX_NEW',
   connectorRef: null,
   keyPresent: false,
@@ -44,6 +50,9 @@ const CONNECTOR = {
   id: 'openai',
   name: 'OpenAI gpt-4o-transcribe',
   provider: 'openai',
+  local: false,
+  enabled: true,
+  configured: true,
   apiKeyRef: 'STT_KEY_OPENAI',
   connectorRef: 'OPENAI_API_KEY',
   keyPresent: true,
@@ -53,7 +62,23 @@ const CONNECTOR_NO_NAME = {
   id: 'unknown-family',
   name: 'Some model',
   provider: null,
+  local: false,
+  enabled: true,
+  configured: false,
   apiKeyRef: 'STT_KEY_UNKNOWN_FAMILY',
+  connectorRef: null,
+  keyPresent: false,
+  keySource: null,
+}
+/* A local recognizer: no key at all, so no credential name and no key field. */
+const LOCAL = {
+  id: 'whisper-local',
+  name: 'Local whisper server',
+  provider: null,
+  local: true,
+  enabled: true,
+  configured: true,
+  apiKeyRef: null,
   connectorRef: null,
   keyPresent: false,
   keySource: null,
@@ -125,6 +150,7 @@ async function loadCard(options = {}) {
     'useState',
     'getState',
     'saveCredential',
+    'saveEnabled',
     `
     const module = { exports: {} };
     ${body}
@@ -138,6 +164,7 @@ async function loadCard(options = {}) {
     options.useState ?? ((initial) => [typeof initial === 'function' ? initial() : initial, () => {}]),
     options.getState ?? (async () => ({ providers: [] })),
     options.saveCredential ?? (async () => ({ ok: true, present: true })),
+    options.saveEnabled ?? (async () => ({ ok: true, registered: true, saved: true })),
   );
 }
 
@@ -246,10 +273,10 @@ test('the name a key is stored under is shown as text, never as a field', async 
   const card = await loadCard();
   const tree = card.SpeechGateView({ t, loading: false, providers: [YANDEX_WITH_KEY], drafts: {} });
 
-  // The only control on the row is the key field and its button: the name is
-  // derived from the record id, so it is not something a person edits here.
+  // The only control on the row is the key field, its button and the switch: the
+  // name is derived from the record id, so it is not something a person edits here.
   const inputs = flat(tree).filter((node) => node.type === 'input');
-  assert.deepEqual(inputs, []);
+  assert.deepEqual(inputs.map((node) => node.props.type), ['checkbox']);
   assert.equal(byType(tree, 'textarea').length, 1);
   const notes = byClass(tree, 'dsg-note').map(textOf);
   assert.ok(notes.includes(DICTIONARIES.ru['card.keyStoredAs'].replace('{0}', 'YANDEX_SPEECHKIT_API_KEY')), notes.join(' | '));
@@ -297,12 +324,102 @@ test('loading, an empty state and a failed read each say something', async () =>
   assert.match(textOf(loading), /Загружаю распознаватели/u);
 
   const empty = card.SpeechGateView({ t, loading: false, providers: [] });
-  assert.match(textOf(empty), /ключ не нужен/u);
+  assert.match(textOf(empty), /Настраивать здесь нечего/u);
 
   const failed = card.SpeechGateView({ t, loading: false, providers: [], error: 'нет связи' });
   assert.match(textOf(failed), /Не удалось сохранить: нет связи/u);
-  // The one sentence about the shared SpeechKit key is always there.
-  assert.match(textOf(empty), /Ключ SpeechKit один и тот же/u);
+  // The one sentence about the Yandex key is always there, in its new wording.
+  assert.match(textOf(empty), /один ключ на все сервисы SpeechKit/u);
+});
+
+test('the header says where the recognizer is chosen', async () => {
+  const card = await loadCard();
+  const tree = card.SpeechGateView({ t, loading: false, providers: [YANDEX_WITH_KEY] });
+
+  const hint = flat(tree).filter((node) => node.props?.['data-source-hint'] === 'true');
+  assert.equal(hint.length, 1, 'the card needs exactly one line saying where the choice is made');
+  const text = textOf(hint[0]);
+  assert.match(text, /Плагины/u);
+  assert.match(text, /Голосовой ввод/u);
+  assert.match(text, /Сервис распознавания/u);
+  // It sits in the header: the title is the first element, this line follows it.
+  const section = tree;
+  assert.equal(section.children[0].type, 'h2');
+  assert.equal(section.children[1], hint[0]);
+});
+
+test('a local recognizer says the key is not needed, and draws no key field', async () => {
+  const card = await loadCard();
+  const tree = card.SpeechGateView({ t, loading: false, providers: [LOCAL] });
+
+  const [item] = byType(tree, 'li');
+  assert.equal(item.props['data-local'], 'true');
+  assert.equal(item.props['data-configured'], 'true');
+  // No field, no save button: there is nothing to paste and nothing to store.
+  assert.deepEqual(byType(tree, 'textarea'), []);
+  assert.deepEqual(byType(tree, 'button'), []);
+  assert.deepEqual(byClass(tree, 'dsg-key-row'), []);
+  // The state line says why, in words.
+  assert.equal(textOf(flat(tree).find((node) => node.props?.['data-key-state'] !== undefined)),
+    'локальный распознаватель, ключ не нужен');
+  // It is a working recognizer, so it keeps its switch.
+  assert.equal(byClass(tree, 'dsg-switch-input').length, 1);
+});
+
+test('a record nobody configured is greyed out, says so and has no switch', async () => {
+  const card = await loadCard();
+  const tree = card.SpeechGateView({ t, loading: false, providers: [YANDEX_WITHOUT_KEY] });
+
+  const [item] = byType(tree, 'li');
+  assert.match(String(item.props.className), /dsg-provider-off/u);
+  assert.equal(item.props['data-configured'], 'false');
+  const lines = flat(tree).filter((node) => node.props?.['data-unconfigured'] === 'true').map(textOf);
+  assert.deepEqual(lines, ['нет ключа — провайдер не используется']);
+  // No switch on something that cannot be turned on...
+  assert.deepEqual(byClass(tree, 'dsg-switch'), []);
+  assert.deepEqual(flat(tree).filter((node) => node.props?.type === 'checkbox'), []);
+  // ...but the field stays: pasting a key is how this record becomes usable.
+  assert.equal(byType(tree, 'textarea').length, 1);
+  assert.equal(byType(tree, 'button').length, 1);
+});
+
+test('the key label and the key state are two elements, never one glued line', async () => {
+  const card = await loadCard();
+  const tree = card.SpeechGateView({ t, loading: false, providers: [YANDEX_WITH_KEY, YANDEX_WITHOUT_KEY] });
+
+  // «API-ключ» is a visible heading of the field now, not only an aria-label.
+  const labels = byClass(tree, 'dsg-field-label').map(textOf);
+  assert.deepEqual(labels, ['API-ключ', 'API-ключ']);
+  // The state is an element of its own.
+  const chips = flat(tree).filter((node) => node.props?.['data-key-state'] !== undefined);
+  assert.deepEqual(chips.map(textOf), ['ключ сохранён', 'ключ не задан']);
+  assert.equal(chips.every((chip) => labels.includes(textOf(chip))), false, 'the state is not the label');
+
+  // The failure the live screen showed: both drawn as one run of text.
+  for (const node of flat(tree)) {
+    assert.doesNotMatch(textOf(node), /API-ключключ/u);
+  }
+  // They are separate elements, in separate containers.
+  assert.equal(byClass(tree, 'dsg-key-row').length, 2);
+  for (const chip of chips) {
+    assert.equal(String(chip.props.className).includes('dsg-key-state'), true);
+  }
+  // The stylesheet keeps them apart as well.
+  const labelRule = CSS.match(/\.dsg-field-label \{[^}]*\}/u)?.[0] ?? '';
+  assert.match(labelRule, /font-weight: 600/u);
+  assert.match(CSS, /\.dsg-key-state \{[^}]*margin-left/u);
+});
+
+test('the switch shows the record\'s state and asks the host to flip it', async () => {
+  const card = await loadCard();
+  const off = card.SpeechGateView({ t, loading: false, providers: [{ ...CONNECTOR, enabled: false }] });
+  const [box] = flat(off).filter((node) => node.props?.type === 'checkbox');
+  assert.equal(box.props.checked, false);
+
+  const on = card.SpeechGateView({ t, loading: false, providers: [CONNECTOR] });
+  const [checked] = flat(on).filter((node) => node.props?.type === 'checkbox');
+  assert.equal(checked.props.checked, true);
+  assert.equal(textOf(byClass(on, 'dsg-switch-label')[0]), 'включён');
 });
 
 /**
@@ -312,10 +429,10 @@ test('loading, an empty state and a failed read each say something', async () =>
  * state machine — initial load, a click, the host's answer — instead of guessing.
  * Effects are run once each, addressed by their hook position, because a fresh
  * closure is created on every render and identity would run them all over again.
- * @param options - `getState` and `saveCredential` stubs.
+ * @param options - `getState`, `saveCredential` and `saveEnabled` stubs.
  * @returns `{ render }`, which draws the card and returns its tree.
  */
-async function mountLive({ getState, saveCredential }) {
+async function mountLive({ getState, saveCredential, saveEnabled }) {
   const slots = [];
   const ran = new Set();
   let pending = [];
@@ -333,7 +450,7 @@ async function mountLive({ getState, saveCredential }) {
     pending.push({ index, effect });
   };
 
-  const card = await loadCard({ useState, useEffect, getState, saveCredential });
+  const card = await loadCard({ useState, useEffect, getState, saveCredential, saveEnabled });
   const render = () => {
     cursor = 0;
     pending = [];
@@ -401,6 +518,59 @@ test('an empty field with a stored key answers «ключ не изменён»'
 
   assert.deepEqual(saved, [{ ref: 'YANDEX_SPEECHKIT_API_KEY', value: '' }]);
   assert.match(textOf(tree), /ключ не изменён/u);
+});
+
+test('flipping the switch reaches the host and redraws the row from its answer', async () => {
+  const flips = [];
+  const stateCalls = [];
+  let enabled = true;
+  const mounted = await mountLive({
+    getState: async () => {
+      stateCalls.push(1);
+      return { providers: [{ ...CONNECTOR, enabled }] };
+    },
+    saveCredential: async () => ({ ok: true, present: true }),
+    saveEnabled: async (id, next) => {
+      flips.push({ id, enabled: next });
+      enabled = next;
+      return { ok: true, id, enabled: next, registered: next, saved: true };
+    },
+  });
+
+  mounted.render();
+  await flush();
+  let tree = mounted.render();
+  assert.equal(flat(tree).filter((node) => node.props?.type === 'checkbox')[0].props.checked, true);
+
+  // The person turns the recognizer off: the host is asked, and the row follows
+  // its answer, not the click.
+  flat(tree).filter((node) => node.props?.type === 'checkbox')[0].props.onChange({ target: { checked: false } });
+  await flush();
+  tree = mounted.render();
+
+  assert.deepEqual(flips, [{ id: 'openai', enabled: false }]);
+  assert.equal(flat(tree).filter((node) => node.props?.type === 'checkbox')[0].props.checked, false);
+  assert.match(textOf(tree), /провайдер выключен/u);
+  // The row is re-read from the host, exactly like after a key is saved.
+  assert.equal(stateCalls.length, 2);
+});
+
+test('a refused switch shows the host\'s sentence under its own row', async () => {
+  const mounted = await mountLive({
+    getState: async () => ({ providers: [CONNECTOR] }),
+    saveCredential: async () => ({ ok: true, present: true }),
+    saveEnabled: async () => { throw new Error('служба распознавания недоступна'); },
+  });
+
+  mounted.render();
+  await flush();
+  const tree = mounted.render();
+  flat(tree).filter((node) => node.props?.type === 'checkbox')[0].props.onChange({ target: { checked: false } });
+  await flush();
+  const after = mounted.render();
+
+  assert.deepEqual(byClass(after, 'dsg-error').map(textOf),
+    ['Не удалось сохранить: служба распознавания недоступна']);
 });
 
 test('a refused save shows the host\'s sentence under its own row', async () => {
