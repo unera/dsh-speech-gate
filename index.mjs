@@ -12,8 +12,9 @@
 //
 // The provider registers itself into `ctx.speechToText`
 // (@deepseek-ai/dsh-experimental-speech-to-text); it never chooses a language
-// on its own and never converts audio — the channel already hands it canonical
-// 16 kHz mono PCM16 WAV.
+// on its own. It converts audio in exactly one place: SpeechKit refuses a
+// request above 1 MB, and raw PCM reaches that ceiling in half a minute, so a
+// long recording is compressed and, if that is still not enough, split.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -66,6 +67,33 @@ const WAV_HEADER_BYTES = 44;
 export const RECHECK_DELAY_MS = 1_500;
 
 export const YANDEX_STT_ENDPOINT = 'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize';
+
+/**
+ * Most audio one SpeechKit request may carry.
+ *
+ * The service documents 1 MB and rejects a bigger body with
+ * `BAD_REQUEST: audio should be less than 1 mb`. The value stays below that on
+ * purpose: the service counts the body it received, not the one we meant to
+ * send, and a request refused on size cannot be retried smaller.
+ */
+export const YANDEX_MAX_REQUEST_BYTES = 900 * 1024;
+
+/**
+ * What one second of audio costs in each of the two formats.
+ *
+ * `lpcm` is the channel's own PCM16 at 16 kHz mono: 32 000 B/s, so 1 MB is ~31 s
+ * of speech. `oggopus` at 32 kbit/s is 4 000 B/s — eight times less, which is 1 MB
+ * every ~225 s, and ~150 KB for the 36-second voice message that started this.
+ */
+const PCM_BYTES_PER_SECOND = SAMPLE_RATE * BYTES_PER_SAMPLE;
+const OGG_OPUS_ARGS = Object.freeze([
+  '-hide_banner', '-loglevel', 'error',
+  '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', 'pipe:0',
+  // Constant bitrate: the request size then follows the duration, and a chunk
+  // that fits does not turn out bigger because the encoder liked a phrase.
+  '-c:a', 'libopus', '-b:a', '32k', '-vbr', 'off',
+  '-f', 'ogg', 'pipe:1',
+]);
 
 // SpeechKit accepts only the region-qualified codes below; a bare `ru`/`en` from
 // the Host is not one of them. `kk` maps to `kk-KZ`, not `kk-KK` — that is what
@@ -984,39 +1012,221 @@ export function wavToPcm(audio) {
   return audio;
 }
 
-/** Ask Yandex SpeechKit for a transcript. */
-export async function transcribeViaSpeechKit(options, input, signal, { fetchImpl = fetch } = {}) {
+/** The failure a person can act on: too much audio for one SpeechKit request. */
+function tooLongError(bytes) {
+  const seconds = Math.round(bytes / PCM_BYTES_PER_SECOND);
+  return new Error(
+    `yandex-stt: the recording is too long (${seconds} s) — SpeechKit takes at most 1 MB per request, `
+    + `and this audio does not fit even compressed and split; send a shorter recording`,
+  );
+}
+
+/** The same kind of actionable message for a compression step that failed. */
+function compressionError(error) {
+  const rawSeconds = Math.floor(YANDEX_MAX_REQUEST_BYTES / PCM_BYTES_PER_SECOND);
+  const reason = error?.code === 'ENOENT'
+    ? 'ffmpeg is not installed on this host (install the ffmpeg package)'
+    : String(error?.message ?? error);
+  return new Error(
+    `yandex-stt: the audio could not be compressed — ${reason}; `
+    + `send a shorter recording (up to ${rawSeconds} s)`,
+  );
+}
+
+const isAbort = (error) => error?.name === 'AbortError';
+
+/**
+ * The signal and the deadline of one transcribe call.
+ *
+ * `timeoutMs` is a budget for the whole operation, not for one request: a
+ * recording that needs five requests must still finish inside it. A caller's
+ * cancellation keeps its own reason, so whoever aborted sees what it expects.
+ * @param signal - the caller's signal, if any.
+ * @param timeoutMs - the budget in milliseconds.
+ * @returns the combined signal plus a check that turns an abort into our words.
+ */
+function operationBudget(signal, timeoutMs) {
+  const ms = Number.isSafeInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0;
+  const deadline = ms > 0 && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : null;
+  const combined = deadline
+    ? (signal ? AbortSignal.any([signal, deadline]) : deadline)
+    : signal ?? null;
+  const check = () => {
+    if (deadline?.aborted) {
+      const seconds = Math.max(1, Math.round(ms / 1000));
+      throw new Error(`yandex-stt: recognition did not finish in ${seconds} s — send a shorter recording`);
+    }
+    if (combined?.aborted) throw combined.reason ?? new Error('yandex-stt: recognition was cancelled');
+    if (signal?.aborted) throw signal.reason ?? new Error('yandex-stt: recognition was cancelled');
+  };
+  return { signal: combined, check };
+}
+
+/**
+ * Encode raw PCM16/16 kHz/mono to OggOpus through ffmpeg.
+ *
+ * SpeechKit accepts `format=oggopus`, and an Ogg container carries the sample
+ * rate itself, so nothing has to be announced: 32 kbit/s constant bitrate is
+ * ~4 KB per second of audio against 32 KB for the same second of raw PCM.
+ * @param pcm - headerless PCM16 samples.
+ * @param signal - cancellation for the child process.
+ * @returns the encoded bytes.
+ */
+export function encodeOggOpus(pcm, signal, { ffmpeg = 'ffmpeg', spawnImpl = spawn } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!pcm || pcm.length === 0) {
+      resolve(new Uint8Array(0));
+      return;
+    }
+    let child;
+    try {
+      child = spawnImpl(ffmpeg, OGG_OPUS_ARGS, { signal });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const encoded = [];
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => { encoded.push(chunk); });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+      if (stderr.length > 2_000) stderr = stderr.slice(-2_000);
+    });
+    // ffmpeg reads the samples from its standard input, so the pipe has to be fed
+    // and closed: `-i pipe:0` waits for the end of the stream before it muxes the
+    // last page. A child that dies early closes the pipe; that error is not the
+    // story, its exit code is.
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength));
+    // A missing binary lands here as ENOENT, an abort as AbortError; both are
+    // reported by the caller in words a person can act on.
+    child.on('error', (error) => reject(error));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg exited with code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
+        return;
+      }
+      const bytes = Buffer.concat(encoded);
+      if (bytes.length === 0) {
+        reject(new Error('ffmpeg produced no audio'));
+        return;
+      }
+      resolve(new Uint8Array(bytes));
+    });
+  });
+}
+
+/**
+ * Glue the chunk transcripts back into one.
+ *
+ * An empty answer is a stretch where nobody spoke: it contributes nothing, and
+ * it must not leave a double space behind. Parts are joined with exactly one
+ * space either way — a chunk boundary falls in the middle of a phrase as often
+ * as between two phrases, and joining `Привет.` and `как дела` without a space
+ * would print `Привет.как дела`.
+ * @param parts - transcripts in audio order.
+ * @returns the single transcript.
+ */
+export function joinTranscripts(parts) {
+  let text = '';
+  for (const part of parts) {
+    const piece = String(part ?? '').replace(/\s+/gu, ' ').trim();
+    if (!piece) continue;
+    text = text ? `${text} ${piece}` : piece;
+  }
+  return text;
+}
+
+/**
+ * Ask Yandex SpeechKit for a transcript.
+ *
+ * A recording that fits the raw-PCM ceiling is sent untouched: one request, no
+ * encoder, no lossy step. Anything longer is compressed to OggOpus first, and
+ * only if even that does not fit is it halved recursively — every request then
+ * carries a body the service accepts, and the transcripts are joined in order.
+ *
+ * `encode` is a seam: tests replace it, and a Host can supply its own encoder
+ * without a binary being installed.
+ */
+export async function transcribeViaSpeechKit(options, input, signal, { fetchImpl = fetch, encode = encodeOggOpus } = {}) {
   const key = options.__apiKey ?? '';
-  const query = new URLSearchParams({
-    lang: yandexLanguage(input.language || options.language),
-    format: 'lpcm',
-    sampleRateHertz: String(SAMPLE_RATE),
-  });
   const endpoint = options.endpoint ?? YANDEX_STT_ENDPOINT;
-  const response = await fetchImpl(`${endpoint}?${query}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Api-Key ${key}`,
-      'Content-Type': 'application/octet-stream',
-    },
-    body: wavToPcm(input.audio),
-    signal,
-  });
-  const raw = typeof response.text === 'function' ? await response.text() : '';
-  let body = null;
-  try {
-    body = raw ? JSON.parse(raw) : null;
-  } catch {
-    body = null;
-  }
-  // SpeechKit reports failures in the body with HTTP 200 now and then, so the
-  // error code decides, not the status alone.
-  if (!response.ok || body?.error_code !== undefined) {
-    const code = body?.error_code ?? `HTTP ${response.status}`;
-    const message = body?.error_message ?? (raw ? raw.slice(0, 200) : 'empty response');
-    throw new Error(`yandex-stt ${code}: ${message}`);
-  }
-  return typeof body?.result === 'string' ? body.result.trim() : '';
+  const lang = yandexLanguage(input.language || options.language);
+  const budget = operationBudget(signal, options.timeoutMs);
+
+  const post = async (payload, format) => {
+    // Checked before the request, not after the refusal: a body over the ceiling
+    // is our arithmetic to fix, not something to send and have rejected.
+    if (payload.length > YANDEX_MAX_REQUEST_BYTES) throw tooLongError(payload.length);
+    budget.check();
+    const query = new URLSearchParams({ lang, format, sampleRateHertz: String(SAMPLE_RATE) });
+    let response;
+    try {
+      response = await fetchImpl(`${endpoint}?${query}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Api-Key ${key}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: payload,
+        signal: budget.signal,
+      });
+    } catch (error) {
+      // A deadline or a cancellation is said in our words, not as an abort.
+      budget.check();
+      throw error;
+    }
+    const raw = typeof response.text === 'function' ? await response.text() : '';
+    let body = null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = null;
+    }
+    // SpeechKit reports failures in the body with HTTP 200 now and then, so the
+    // error code decides, not the status alone.
+    if (!response.ok || body?.error_code !== undefined) {
+      const code = body?.error_code ?? `HTTP ${response.status}`;
+      const message = body?.error_message ?? (raw ? raw.slice(0, 200) : 'empty response');
+      throw new Error(`yandex-stt ${code}: ${message}`);
+    }
+    return typeof body?.result === 'string' ? body.result.trim() : '';
+  };
+
+  /** Compress one stretch, turning an encoder failure into an actionable error. */
+  const compress = async (pcm) => {
+    budget.check();
+    try {
+      const encoded = await encode(pcm, budget.signal);
+      if (!encoded || encoded.length === 0) throw new Error('the encoder produced no audio');
+      return encoded;
+    } catch (error) {
+      budget.check();
+      if (isAbort(error)) throw error;
+      throw compressionError(error);
+    }
+  };
+
+  /** Recognize one stretch of PCM, splitting it while one request would be too big. */
+  const recognize = async (pcm) => {
+    budget.check();
+    if (pcm.length <= YANDEX_MAX_REQUEST_BYTES) return [await post(pcm, 'lpcm')];
+    const encoded = await compress(pcm);
+    if (encoded.length <= YANDEX_MAX_REQUEST_BYTES) return [await post(encoded, 'oggopus')];
+    // Compression did not bring it under the ceiling — either it does not help at
+    // all, or the stretch is simply long. Halving it keeps every request legal and
+    // the order of the transcripts the order of the audio. The cut is made on a
+    // sample boundary and never below half a second: smaller pieces save nothing.
+    const half = Math.floor(pcm.length / 2 / BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE;
+    if (half < PCM_BYTES_PER_SECOND / 2) throw tooLongError(pcm.length);
+    const parts = [];
+    for (const slice of [pcm.subarray(0, half), pcm.subarray(half)]) {
+      parts.push(...await recognize(slice));
+    }
+    return parts;
+  };
+
+  return joinTranscripts(await recognize(wavToPcm(input.audio)));
 }
 
 /** Run a local command that prints the transcript. */

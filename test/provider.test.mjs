@@ -20,11 +20,14 @@ import {
   rosterLine,
   runCommand,
   stripOutput,
+  encodeOggOpus,
+  joinTranscripts,
   transcribeViaApi,
   transcribeViaSpeechKit,
   wavSeconds,
   wavToPcm,
   yandexLanguage,
+  YANDEX_MAX_REQUEST_BYTES,
   YANDEX_STT_ENDPOINT,
 } from '../index.mjs';
 
@@ -455,6 +458,271 @@ test('an empty SpeechKit result is an empty transcript, not an error', async () 
   const fetchImpl = async () => ({ ok: true, status: 200, async text() { return JSON.stringify({ result: '' }); } });
   const text = await transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(0.1) }, undefined, { fetchImpl });
   assert.equal(text, '');
+});
+
+/**
+ * A SpeechKit stand-in that answers with the given transcripts in order and
+ * records every request: its format, its language and the exact body.
+ */
+function speechKitRecorder(answers) {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const query = new URL(url).searchParams;
+    calls.push({ url, format: query.get('format'), lang: query.get('lang'), body: Uint8Array.from(options.body), options });
+    const answer = typeof answers === 'function' ? answers(calls.length - 1) : answers[calls.length - 1] ?? '';
+    return { ok: true, status: 200, async text() { return JSON.stringify({ result: answer }); } };
+  };
+  return { calls, fetchImpl };
+}
+
+/** The encoder seam every long-recording test needs: no ffmpeg, no binary. */
+function fixedSizeEncoder(bytes, seen = []) {
+  return async (pcm) => {
+    seen.push(pcm.length);
+    return new Uint8Array(bytes ?? pcm.length);
+  };
+}
+
+test('a recording under the ceiling still goes untouched, and no encoder runs', async () => {
+  const encoded = [];
+  const { calls, fetchImpl } = speechKitRecorder(['привет мир']);
+  const wav = canonicalWav(10); // 320 000 B of PCM, well under 900 KiB
+  const text = await transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: wav, language: 'ru' }, undefined, {
+    fetchImpl,
+    encode: fixedSizeEncoder(1_000, encoded),
+  });
+  assert.equal(text, 'привет мир');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].format, 'lpcm');
+  assert.equal(calls[0].lang, 'ru-RU');
+  assert.equal(calls[0].body.length, wav.length - 44);
+  assert.deepEqual(encoded, [], 'the lossy step is not taken when nothing forces it');
+});
+
+test('a 36-second voice message is compressed and sent once as oggopus', async () => {
+  const encoded = [];
+  const { calls, fetchImpl } = speechKitRecorder(['готово']);
+  const wav = canonicalWav(36); // 1 152 000 B of PCM: exactly what SpeechKit refused
+  const text = await transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: wav }, undefined, {
+    fetchImpl,
+    // 32 kbit/s over 36 s, which is what ffmpeg really returns for this input.
+    encode: fixedSizeEncoder(147_000, encoded),
+  });
+  assert.equal(text, 'готово');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].format, 'oggopus');
+  assert.equal(calls[0].body.length, 147_000);
+  assert.ok(calls[0].body.length <= YANDEX_MAX_REQUEST_BYTES);
+  assert.deepEqual(encoded, [32_000 * 36], 'one encode, of the whole payload');
+});
+
+test('audio that compression cannot shrink is split, and the transcripts are joined in order', async () => {
+  const encoded = [];
+  const answers = (index) => `часть ${index + 1}`;
+  const { calls, fetchImpl } = speechKitRecorder(answers);
+  const wav = canonicalWav(90); // 2 880 000 B: 3.1x the ceiling
+  const text = await transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: wav }, undefined, {
+    fetchImpl,
+    // The worst case: the encoder returns exactly what it was given.
+    encode: fixedSizeEncoder(null, encoded),
+  });
+  // 2 880 000 → 1 440 000 ×2 → 720 000 ×4: four requests, each under the ceiling.
+  assert.equal(calls.length, 4);
+  assert.deepEqual(encoded, [2_880_000, 1_440_000, 1_440_000]);
+  for (const call of calls) assert.ok(call.body.length <= YANDEX_MAX_REQUEST_BYTES);
+  // The pieces cover the whole recording, in order, without a lost or doubled byte.
+  const sent = calls.reduce((total, call) => total + call.body.length, 0);
+  assert.equal(sent, 2_880_000);
+  assert.deepEqual(calls.map((call) => call.body.length), [720_000, 720_000, 720_000, 720_000]);
+  assert.equal(text, 'часть 1 часть 2 часть 3 часть 4');
+});
+
+test('an empty answer for one piece does not break the join', async () => {
+  const answers = ['первый', '   ', '', 'четвёртый'];
+  const { calls, fetchImpl } = speechKitRecorder(answers);
+  const text = await transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(90) }, undefined, {
+    fetchImpl,
+    encode: fixedSizeEncoder(null),
+  });
+  assert.equal(calls.length, 4);
+  assert.equal(text, 'первый четвёртый');
+  assert.equal(text.includes('  '), false, 'no double space where a piece said nothing');
+});
+
+test('a cancellation stops the run and leaves no request behind', async () => {
+  const controller = new AbortController();
+  const encoded = [];
+  const formats = [];
+  const fetchImpl = async (url, options) => {
+    formats.push(new URL(url).searchParams.get('format'));
+    controller.abort(new Error('host cancelled'));
+    options.signal.throwIfAborted?.();
+    throw options.signal.reason ?? new Error('aborted');
+  };
+  await assert.rejects(
+    () => transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(90) }, controller.signal, {
+      fetchImpl,
+      encode: fixedSizeEncoder(null, encoded),
+    }),
+    /host cancelled/u,
+  );
+  assert.equal(formats.length, 1, 'the remaining pieces are never requested');
+  // The stretch was compressed twice before the first request was made; nothing
+  // is encoded after the abort either.
+  assert.deepEqual(encoded, [2_880_000, 1_440_000]);
+});
+
+test('a signal that is already aborted sends nothing at all', async () => {
+  const { calls, fetchImpl } = speechKitRecorder(['нет']);
+  await assert.rejects(
+    () => transcribeViaSpeechKit(
+      { __apiKey: 'k' },
+      { audio: canonicalWav(36) },
+      AbortSignal.abort(),
+      { fetchImpl, encode: fixedSizeEncoder(1_000) },
+    ),
+    { name: 'AbortError' },
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('a missing ffmpeg is a human error, not the service BAD_REQUEST', async () => {
+  const { calls, fetchImpl } = speechKitRecorder(['нет']);
+  const encode = async () => {
+    const error = new Error('spawn ffmpeg ENOENT');
+    error.code = 'ENOENT';
+    throw error;
+  };
+  await assert.rejects(
+    () => transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(36) }, undefined, { fetchImpl, encode }),
+    (error) => {
+      assert.match(error.message, /the audio could not be compressed/u);
+      assert.match(error.message, /ffmpeg is not installed/u);
+      assert.match(error.message, /send a shorter recording/u);
+      assert.equal(/BAD_REQUEST/u.test(error.message), false);
+      return true;
+    },
+  );
+  assert.equal(calls.length, 0, 'nothing is sent: the failure is local');
+});
+
+test('an encoder that fails for another reason keeps its own words', async () => {
+  const { calls, fetchImpl } = speechKitRecorder(['нет']);
+  const encode = async () => { throw new Error('ffmpeg exited with code 1: unknown encoder'); };
+  await assert.rejects(
+    () => transcribeViaSpeechKit({ __apiKey: 'k' }, { audio: canonicalWav(36) }, undefined, { fetchImpl, encode }),
+    (error) => {
+      assert.match(error.message, /the audio could not be compressed/u);
+      assert.match(error.message, /unknown encoder/u);
+      return true;
+    },
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('the deadline is one budget for the whole operation, not one per request', async () => {
+  const calls = [];
+  const fetchImpl = (url, options) => new Promise((resolve, reject) => {
+    calls.push(url);
+    options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+  });
+  await assert.rejects(
+    () => transcribeViaSpeechKit(
+      { __apiKey: 'k', timeoutMs: 50 },
+      { audio: canonicalWav(36) },
+      undefined,
+      { fetchImpl, encode: fixedSizeEncoder(1_000) },
+    ),
+    /recognition did not finish in/u,
+  );
+  assert.equal(calls.length, 1);
+});
+
+test('the ffmpeg seam feeds stdin, collects stdout and reports a non-zero exit', async () => {
+  let runs = 0;
+  const fed = [];
+  const spawnImpl = () => {
+    runs += 1;
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    // ffmpeg reads `pipe:0` until it is closed, so a seam that never writes gives
+    // no output at all and the encode hangs — the fake stdin is here to catch that.
+    child.stdin = { on() {}, end(chunk) { fed.push(Buffer.from(chunk)); } };
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('OggS '));
+      child.stdout.emit('data', Buffer.from('bytes'));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  const pcm = new Uint8Array(64_000).fill(3);
+  const encoded = await encodeOggOpus(pcm, undefined, { spawnImpl });
+  assert.equal(Buffer.from(encoded).toString(), 'OggS bytes');
+  assert.equal(runs, 1);
+  assert.equal(fed.length, 1, 'the samples are written once and the pipe is closed');
+  assert.deepEqual(Buffer.from(fed[0]), Buffer.from(pcm));
+
+  const failing = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    setImmediate(() => {
+      child.stderr.emit('data', Buffer.from('no libopus'));
+      child.emit('close', 1);
+    });
+    return child;
+  };
+  await assert.rejects(
+    () => encodeOggOpus(new Uint8Array(64_000), undefined, { spawnImpl: failing }),
+    /ffmpeg exited with code 1: no libopus/u,
+  );
+
+  // A binary that is not there arrives as an error event, which is ENOENT.
+  await assert.rejects(
+    () => encodeOggOpus(new Uint8Array(64_000), undefined, {
+      spawnImpl: () => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        setImmediate(() => {
+          const error = new Error('spawn ffmpeg ENOENT');
+          error.code = 'ENOENT';
+          child.emit('error', error);
+        });
+        return child;
+      },
+    }),
+    { code: 'ENOENT' },
+  );
+});
+
+test('the encoder is asked for OggOpus at 32 kbit/s from a PCM pipe', async () => {
+  const seen = [];
+  const spawnImpl = (command, args) => {
+    seen.push({ command, args });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('OggS'));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  await encodeOggOpus(new Uint8Array(4), undefined, { spawnImpl });
+  assert.equal(seen[0].command, 'ffmpeg');
+  const line = seen[0].args.join(' ');
+  assert.match(line, /-f s16le -ar 16000 -ac 1 -i pipe:0/u);
+  assert.match(line, /-c:a libopus -b:a 32k -vbr off/u);
+  assert.match(line, /-f ogg pipe:1$/u);
+});
+
+test('joining transcripts keeps one space and skips empty pieces', () => {
+  assert.equal(joinTranscripts(['привет.', 'как дела']), 'привет. как дела');
+  assert.equal(joinTranscripts(['', '  ', 'раз']), 'раз');
+  assert.equal(joinTranscripts([]), '');
+  assert.equal(joinTranscripts(['раз  два', '\nтри\n']), 'раз два три');
 });
 
 test('a yandex provider resolves the shared key and hits SpeechKit', async () => {

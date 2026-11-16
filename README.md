@@ -287,9 +287,27 @@ What the entry produces:
 | --- | --- |
 | request | `POST https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?lang=ru-RU&format=lpcm&sampleRateHertz=16000` |
 | auth | `Authorization: Api-Key <the key stored under this record's name>` |
-| body | the samples of the incoming WAV with the 44-byte RIFF header dropped — no resampling, no re-encoding |
+| body | up to 900 KiB: the samples of the incoming WAV with the 44-byte RIFF header dropped — no resampling, no re-encoding. Longer audio is sent as `format=oggopus`, and split if even that does not fit (see below) |
 | response | `{"result": "…"}` → the transcript; an empty `result` is an empty transcript, not a failure |
 | failure | `{"error_code": …, "error_message": …}` → `yandex-stt <code>: <message>` |
+
+### Long recordings
+
+SpeechKit takes at most 1 MB per request; raw PCM16 at 16 kHz mono is 32 000 B/s,
+so the ceiling arrived at ~30 seconds and a 36-second voice message was refused
+with `BAD_REQUEST: audio should be less than 1 mb`. Three rules keep it working:
+
+- **under 900 KiB of PCM (~28 s)** — sent untouched, exactly as before: one
+  request, no encoder, no lossy step;
+- **longer** — one `ffmpeg` pass to OggOpus (32 kbit/s constant bitrate, ~4 KB per
+  second), so 36 s is ~147 KB and the ceiling moves to ~3.7 minutes per request;
+- **still over the ceiling** — the audio is halved until every request fits, and
+  the transcripts are joined in order. A missing or failing `ffmpeg` says so
+  ("the audio could not be compressed…") instead of passing the service's own
+  `BAD_REQUEST` through.
+
+`timeoutMs` (default 120 s) is a budget for the whole call, not per request, and
+the caller's abort signal stops the remaining requests and the encoder with it.
 
 `provider` is the only selector; `model` and `baseUrl` do not apply and are set
 to `null`. The entry has a credential name of its own — `STT_KEY_YANDEX_STT` for
